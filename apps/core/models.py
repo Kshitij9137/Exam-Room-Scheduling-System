@@ -116,6 +116,7 @@ class Exam(models.Model):
         PLANNED = "PLANNED", "Planned"
         SCHEDULED = "SCHEDULED", "Scheduled"
         UNASSIGNED = "UNASSIGNED", "Unassigned"
+        NOT_REQUIRED = "NOT_REQUIRED", "Not required"
 
     exam_id = models.CharField(primary_key=True, max_length=20, validators=[id_validator("exam")])
     course = models.ForeignKey(Course, on_delete=models.PROTECT, related_name="exams")

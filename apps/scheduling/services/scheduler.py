@@ -50,16 +50,34 @@ def _next_run_id():
 def _reset_exam_statuses(term):
     for exam in Exam.objects.filter(
         term=term,
-        status__in=[Exam.Status.SCHEDULED, Exam.Status.UNASSIGNED],
+        status__in=[
+            Exam.Status.SCHEDULED,
+            Exam.Status.UNASSIGNED,
+            Exam.Status.NOT_REQUIRED,
+        ],
     ).order_by("exam_id"):
         transition(exam, Exam.Status.PLANNED)
 
 
-def _students_for_exam(context, exam):
-    students = context.students_by_exam.get(exam.exam_id, set())
+def _students_for_exam(context, exam, on_date=None):
+    periods = getattr(context, "enrollment_periods_by_exam", {}).get(
+        exam.exam_id
+    )
+    if periods is None:
+        student_ids = context.students_by_exam.get(exam.exam_id, set())
+    else:
+        student_ids = {
+            student_id
+            for student_id, effective_from, effective_to in periods
+            if on_date is None
+            or (
+                effective_from <= on_date
+                and (effective_to is None or effective_to >= on_date)
+            )
+        }
     return [
         context.students[student_id]
-        for student_id in sorted(students)
+        for student_id in sorted(student_ids)
         if student_id in context.students
     ]
 
@@ -106,6 +124,9 @@ def _candidate_intervals(context, exam, students):
     for slot in slots:
         if slot.start_time < earliest or slot.start_time >= latest:
             continue
+        active_students = _students_for_exam(context, exam, slot.slot_date)
+        if not active_students:
+            continue
         start_at = dt.datetime.combine(
             slot.slot_date, slot.start_time, tzinfo=dt.timezone.utc
         )
@@ -117,7 +138,7 @@ def _candidate_intervals(context, exam, students):
                     slot.slot_date,
                 ),
             )
-            for student in students
+            for student in active_students
         ]
         duration = max(
             (
@@ -297,11 +318,11 @@ def try_schedule_exam(context, exam):
     """Try every configured slot, returning ``(scheduled, rejection_counts)``."""
     students = _students_for_exam(context, exam)
     if not students:
-        transition(exam, Exam.Status.SCHEDULED)
+        transition(exam, Exam.Status.NOT_REQUIRED)
         record_event(
             context,
             exam,
-            ScheduleEvent.EventType.ASSIGNED,
+            ScheduleEvent.EventType.NOT_REQUIRED,
             {"reason": "no_active_enrollments", "allocated_count": 0},
         )
         return True, Counter()
@@ -390,6 +411,7 @@ def run_scheduler(seed=None, run_type=SchedulerRun.RunType.BASELINE, reset_exams
 
     scheduled_count = 0
     exams_with_assignments = 0
+    not_required_count = 0
     unassigned_count = 0
     failures = []
 
@@ -400,7 +422,9 @@ def run_scheduler(seed=None, run_type=SchedulerRun.RunType.BASELINE, reset_exams
         try:
             scheduled, _reasons = try_schedule_exam(context, exam)
             transaction.savepoint_commit(savepoint_id)
-            if scheduled:
+            if exam.status == Exam.Status.NOT_REQUIRED:
+                not_required_count += 1
+            elif exam.status == Exam.Status.SCHEDULED:
                 scheduled_count += 1
                 if context.exam_slots.get(exam.exam_id):
                     exams_with_assignments += 1
@@ -439,6 +463,7 @@ def run_scheduler(seed=None, run_type=SchedulerRun.RunType.BASELINE, reset_exams
     run.finished_at = timezone.now()
     run.notes = (
         f"term={term}; scheduled={scheduled_count}; "
+        f"not_required={not_required_count}; "
         f"scheduled_with_assignments={exams_with_assignments}; "
         f"unassigned={unassigned_count}; failed_exam_persistence={len(failures)}"
     )

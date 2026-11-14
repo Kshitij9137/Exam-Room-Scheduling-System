@@ -6,7 +6,9 @@ from django.core.management import call_command
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
+from apps.core.models import Student
 from apps.core.services.data_generator import generate_and_persist
+from apps.dashboard.services import conflict_graph_data, exam_detail
 from apps.scheduling.models import ScheduleAssignment
 from apps.scheduling.services.scheduler import run_scheduler
 from generator.config import SEED_DEFAULT
@@ -44,11 +46,60 @@ class PopulatedPagesTests(TestCase):
             .first()
         )
 
+    def setUp(self):
+        self.client.force_login(
+            User.objects.create_user(
+                "viewer",
+                password="test-pass-123",
+                is_staff=True,
+            )
+        )
+
     def test_dashboard_shows_latest_run_and_business_metrics(self):
         response = self.client.get(reverse("dashboard:home"))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, self.scheduler_run.run_id)
         self.assertContains(response, "Business metrics")
+
+    def test_dashboard_stays_on_baseline_after_anomaly_injection(self):
+        from apps.validation.services.anomaly_injector import inject
+
+        with tempfile.TemporaryDirectory(prefix="dashboard_iso_") as tmpdir:
+            with override_settings(BASE_DIR=Path(tmpdir)):
+                inject(self.scheduler_run.run_id)
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertContains(response, self.scheduler_run.run_id)
+        self.assertContains(response, "BASELINE")
+
+    def test_exam_detail_and_conflict_graph_stay_on_baseline_after_anomaly_injection(
+        self,
+    ):
+        from apps.validation.services.anomaly_injector import inject
+
+        with tempfile.TemporaryDirectory(prefix="dashboard_iso_") as tmpdir:
+            with override_settings(BASE_DIR=Path(tmpdir)):
+                inject(self.scheduler_run.run_id)
+
+        self.assertEqual(
+            exam_detail(self.assignment.exam)["run"],
+            self.scheduler_run,
+        )
+
+        baseline_slots = {}
+        for assignment in ScheduleAssignment.objects.filter(
+            run=self.scheduler_run
+        ).order_by("start_at", "assignment_id"):
+            baseline_slots.setdefault(
+                assignment.exam_id, assignment.start_at.isoformat()
+            )
+        graph = conflict_graph_data(top_n=1000)
+        self.assertEqual(
+            {node["id"]: node["slot"] for node in graph["nodes"]},
+            {
+                node["id"]: baseline_slots.get(node["id"], "")
+                for node in graph["nodes"]
+            },
+        )
 
     def test_timetable_lists_assigned_exam(self):
         response = self.client.get(reverse("dashboard:timetable"))
@@ -92,6 +143,36 @@ class PopulatedPagesTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Enrollments")
+
+    def test_non_staff_student_can_only_lookup_their_own_record(self):
+        own_student = Student.objects.get(pk="STU-000001")
+        user = User.objects.create_user(
+            "student_viewer",
+            email=own_student.email,
+            password="test-password",
+        )
+        self.client.force_login(user)
+
+        own_response = self.client.get(
+            reverse("dashboard:student_lookup"),
+            {"q": own_student.student_id},
+        )
+        other_response = self.client.get(
+            reverse("dashboard:student_lookup"),
+            {"q": "STU-000002"},
+        )
+
+        self.assertEqual(own_response.context["student"], own_student)
+        self.assertIsNone(other_response.context["student"])
+        self.assertNotContains(other_response, "Student 00002")
+
+    def test_non_staff_exam_detail_does_not_expose_student_roster(self):
+        user = User.objects.create_user("regular_viewer", "test-password")
+
+        context = exam_detail(self.assignment.exam, user=user)
+
+        self.assertEqual(context["assigned_students"], [])
+        self.assertEqual(context["accommodations"], [])
 
     def test_student_lookup_accepts_email(self):
         from apps.core.models import Student

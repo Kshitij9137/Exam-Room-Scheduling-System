@@ -1,3 +1,4 @@
+import datetime as dt
 from collections import defaultdict
 
 from django.db.models import Count, Q
@@ -37,12 +38,17 @@ class SchedulerTests(TestCase):
             Exam.objects.filter(term=TERM).values_list("status", flat=True)
         )
         self.assertLessEqual(
-            statuses, {Exam.Status.SCHEDULED, Exam.Status.UNASSIGNED}
+            statuses,
+            {Exam.Status.SCHEDULED, Exam.Status.UNASSIGNED, Exam.Status.NOT_REQUIRED},
         )
         self.assertEqual(
             Exam.objects.filter(
                 term=TERM,
-                status__in=[Exam.Status.SCHEDULED, Exam.Status.UNASSIGNED],
+                status__in=[
+                    Exam.Status.SCHEDULED,
+                    Exam.Status.UNASSIGNED,
+                    Exam.Status.NOT_REQUIRED,
+                ],
             ).count(),
             Exam.objects.filter(term=TERM).count(),
         )
@@ -101,6 +107,74 @@ class SchedulerTests(TestCase):
             "Unassigned exams must not retain partial student allocations.",
         )
 
+    def test_zero_enrollment_exam_is_marked_not_required(self):
+        exam = Exam.objects.filter(term=TERM).order_by("exam_id").first()
+        Enrollment.objects.filter(
+            course=exam.course,
+            term=exam.term,
+        ).update(status=Enrollment.Status.DROPPED)
+
+        run = run_scheduler(seed=SEED_DEFAULT)
+        exam.refresh_from_db()
+
+        self.assertEqual(exam.status, Exam.Status.NOT_REQUIRED)
+        self.assertFalse(
+            ScheduleAssignment.objects.filter(run=run, exam=exam).exists()
+        )
+        self.assertFalse(
+            StudentRoomAllocation.objects.filter(run=run, exam=exam).exists()
+        )
+        self.assertFalse(
+            UnassignedExam.objects.filter(run=run, exam=exam).exists()
+        )
+        self.assertTrue(
+            ScheduleEvent.objects.filter(
+                run=run,
+                exam=exam,
+                event_type=ScheduleEvent.EventType.NOT_REQUIRED,
+            ).exists()
+        )
+
+    def test_only_effective_enrollments_are_allocated_on_scheduled_date(self):
+        exam = Exam.objects.filter(term=TERM).order_by("exam_id").first()
+        start = dt.date(2026, 12, 15)
+        end = dt.date(2026, 12, 18)
+        Enrollment.objects.filter(
+            course=exam.course,
+            term=exam.term,
+            status=Enrollment.Status.ACTIVE,
+        ).update(effective_from=start, effective_to=end)
+
+        run = run_scheduler(seed=SEED_DEFAULT)
+        assignment = ScheduleAssignment.objects.filter(
+            run=run,
+            exam=exam,
+        ).first()
+
+        self.assertIsNotNone(assignment)
+        self.assertGreaterEqual(assignment.start_at.date(), start)
+        self.assertLessEqual(assignment.start_at.date(), end)
+        expected_students = set(
+            Enrollment.objects.filter(
+                course=exam.course,
+                term=exam.term,
+                status=Enrollment.Status.ACTIVE,
+                effective_from__lte=assignment.start_at.date(),
+            )
+            .filter(
+                Q(effective_to__isnull=True)
+                | Q(effective_to__gte=assignment.start_at.date())
+            )
+            .values_list("student_id", flat=True)
+        )
+        allocated_students = set(
+            StudentRoomAllocation.objects.filter(
+                run=run,
+                exam=exam,
+            ).values_list("student_id", flat=True)
+        )
+        self.assertEqual(allocated_students, expected_students)
+
     def test_unassigned_rows_always_include_reason_and_evidence(self):
         run = run_scheduler(seed=SEED_DEFAULT)
         for row in UnassignedExam.objects.filter(run=run):
@@ -134,6 +208,34 @@ class SchedulerTests(TestCase):
             ScheduleEvent.objects.filter(run=first_run).count(), first_events
         )
         self.assertNotEqual(first_run.run_id, second_run.run_id)
+
+    def test_rerun_skips_high_existing_invigilator_assignment_id(self):
+        first_run = run_scheduler(seed=SEED_DEFAULT)
+        assignment = ScheduleAssignment.objects.filter(
+            run=first_run
+        ).first()
+        invigilator = (
+            InvigilatorAssignment.objects.exclude(
+                assignment=assignment
+            )
+            .values_list("invigilator_id", flat=True)
+            .first()
+        )
+        self.assertIsNotNone(invigilator)
+        InvigilatorAssignment.objects.create(
+            ias_id="IAS-999999",
+            assignment=assignment,
+            invigilator_id=invigilator,
+        )
+
+        second_run = run_scheduler(seed=SEED_DEFAULT)
+
+        self.assertEqual(second_run.status, SchedulerRun.Status.COMPLETED)
+        self.assertIn("failed_exam_persistence=0", second_run.notes)
+        self.assertGreater(
+            ScheduleAssignment.objects.filter(run=second_run).count(),
+            0,
+        )
 
     def test_schedule_obeys_room_staff_student_and_accommodation_constraints(self):
         run = run_scheduler(seed=SEED_DEFAULT)

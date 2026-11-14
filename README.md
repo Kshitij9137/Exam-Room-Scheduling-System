@@ -3,7 +3,7 @@
 Django, SQLite, and Bootstrap 5 application for generating synthetic university
 exam data, scheduling exams into rooms, validating schedules, evaluating
 deliberately injected anomalies, and reviewing results through a dashboard.
-**Phases 3–7 are implemented.**
+
 
 ## Setup and run
 
@@ -30,10 +30,14 @@ python manage.py export_data
 python manage.py runserver
 ```
 
-Open `http://127.0.0.1:8000/`. Read-only pages are publicly accessible.
-Sign in at `/accounts/login/` with a staff/superuser account to run dashboard
-workflow actions. Reproducibility verification must be run before scheduling
-because it requires no append-only schedule events. See the [run book](docs/run_book.md)
+Open `http://127.0.0.1:8000/`. Read-only timetable and dashboard pages are
+public. Student lookup requires authentication; students can view only their
+own record when their account email matches, while staff and Academic
+Administrators can look up any student. Exam detail rosters and accommodation
+details are restricted to staff and Academic Administrators. Sign in at
+`/accounts/login/` with a staff/superuser account to run dashboard workflow
+actions. Reproducibility verification must be run before scheduling because it
+requires no append-only schedule events. See the [run book](docs/run_book.md)
 for a clean-state reset and the judge-facing demo walkthrough.
 
 Use `--scale full` instead of `--scale starter` to generate 5,000 students,

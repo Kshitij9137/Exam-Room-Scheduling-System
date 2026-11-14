@@ -60,7 +60,12 @@ def compute_business_metrics(run):
     unassigned_exam_ids = {row.exam_id for row in unassigned_rows}
     event_exam_ids = set(
         ScheduleEvent.objects.filter(run=run, exam__isnull=False)
-        .exclude(event_type=ScheduleEvent.EventType.CANCELLED)
+        .exclude(
+            event_type__in=[
+                ScheduleEvent.EventType.CANCELLED,
+                ScheduleEvent.EventType.NOT_REQUIRED,
+            ]
+        )
         .values_list("exam_id", flat=True)
     )
     represented_exam_ids = (
@@ -69,17 +74,27 @@ def compute_business_metrics(run):
     scheduled_exam_ids = represented_exam_ids - unassigned_exam_ids
     total_exams = len(represented_exam_ids)
 
-    active_enrollments_by_exam = dict(
+    assignment_exam_dates = {}
+    for assignment in assignments:
+        assignment_exam_dates.setdefault(assignment.exam_id, assignment.start_at.date())
+
+    enrollment_rows = list(
         Enrollment.objects.filter(
             term=term,
             status=Enrollment.Status.ACTIVE,
-            course__exams__exam_id__in=scheduled_exam_ids,
             course__exams__term=term,
-        )
-        .values("course__exams__exam_id")
-        .annotate(count=Count("enrollment_id"))
-        .values_list("course__exams__exam_id", "count")
+            course__exams__exam_id__in=scheduled_exam_ids,
+        ).values_list("course__exams__exam_id", "effective_from", "effective_to")
     )
+    active_enrollments_by_exam = {}
+    for exam_id, effective_from, effective_to in enrollment_rows:
+        exam_date = assignment_exam_dates.get(exam_id)
+        if exam_date and effective_from <= exam_date and (
+            effective_to is None or effective_to >= exam_date
+        ):
+            active_enrollments_by_exam[exam_id] = (
+                active_enrollments_by_exam.get(exam_id, 0) + 1
+            )
     allocation_counts = dict(
         StudentRoomAllocation.objects.filter(run=run)
         .values("exam_id")

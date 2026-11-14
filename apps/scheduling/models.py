@@ -257,6 +257,7 @@ class ScheduleEvent(models.Model):
         CANCELLED = "CANCELLED", "Cancelled"
         UNASSIGNED = "UNASSIGNED", "Unassigned"
         SUPERSEDED = "SUPERSEDED", "Superseded"
+        NOT_REQUIRED = "NOT_REQUIRED", "Not required"
 
     event_id = models.CharField(primary_key=True, max_length=10, validators=[id_validator("event")])
     run = models.ForeignKey(SchedulerRun, on_delete=models.PROTECT, related_name="events")

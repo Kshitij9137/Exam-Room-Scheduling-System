@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 
+from django.conf import settings
 from django.db.models import Count, Q
 
 from apps.core.models import (
@@ -9,6 +10,8 @@ from apps.core.models import (
     Enrollment,
     ExamRequirement,
     ExamRequirementEquipment,
+    Invigilator,
+    Room,
     RoomCapacity,
 )
 from apps.scheduling.models import (
@@ -200,8 +203,6 @@ def check_invigilator_double_booking(run):
             for second in items[index + 1:]:
                 if second.start_at >= first.end_at:
                     break
-                if first.exam_id == second.exam_id:
-                    continue
                 if not _overlap(
                     first.start_at,
                     first.end_at,
@@ -219,6 +220,130 @@ def check_invigilator_double_booking(run):
                         }
                     )
     return violations, len(assignments)
+
+
+def check_resource_status(run):
+    violations = []
+    assignments = list(_assignments(run).select_related("room"))
+    for assignment in assignments:
+        if assignment.room.status != Room.Status.ACTIVE:
+            violations.append(
+                {
+                    "code": CODE.INACTIVE_ROOM,
+                    "assignment": assignment,
+                    "entity_id": assignment.room_id,
+                    "detail": "An inactive room was assigned.",
+                }
+            )
+
+    inv_assignments = list(
+        InvigilatorAssignment.objects.filter(
+            assignment__run=run,
+            assignment__status=ScheduleAssignment.Status.ASSIGNED,
+        ).select_related("assignment", "invigilator")
+    )
+    for row in inv_assignments:
+        if row.invigilator.status != Invigilator.Status.ACTIVE:
+            violations.append(
+                {
+                    "code": CODE.INACTIVE_INVIGILATOR,
+                    "assignment": row.assignment,
+                    "entity_id": row.invigilator_id,
+                    "detail": "An inactive invigilator was assigned.",
+                }
+            )
+    return violations, len(assignments) + len(inv_assignments)
+
+
+def check_invigilator_daily_limits(run):
+    rows = list(
+        InvigilatorAssignment.objects.filter(
+            assignment__run=run,
+            assignment__status=ScheduleAssignment.Status.ASSIGNED,
+        ).select_related("assignment", "invigilator")
+    )
+    by_invigilator_day = defaultdict(list)
+    for row in rows:
+        by_invigilator_day[(row.invigilator_id, row.assignment.start_at.date())].append(row)
+
+    violations = []
+    for (invigilator_id, _date), day_rows in by_invigilator_day.items():
+        intervals = sorted(
+            (row.assignment.start_at, row.assignment.end_at)
+            for row in day_rows
+        )
+        total_minutes = 0
+        interval_start, interval_end = intervals[0]
+        for start_at, end_at in intervals[1:]:
+            if start_at >= interval_end:
+                total_minutes += (
+                    interval_end - interval_start
+                ).total_seconds() / 60
+                interval_start, interval_end = start_at, end_at
+            else:
+                interval_end = max(interval_end, end_at)
+        total_minutes += (
+            interval_end - interval_start
+        ).total_seconds() / 60
+        limit_minutes = float(day_rows[0].invigilator.max_daily_hours) * 60
+        if total_minutes > limit_minutes:
+            violations.append(
+                {
+                    "code": CODE.INVIGILATOR_DAILY_LIMIT,
+                    "assignment": day_rows[0].assignment,
+                    "entity_id": invigilator_id,
+                    "detail": (
+                        f"{int(total_minutes)} minutes exceeds "
+                        f"{int(limit_minutes)}-minute daily limit."
+                    ),
+                }
+            )
+    return violations, len(rows)
+
+
+def check_invigilator_consecutive_limits(run):
+    limit_hours = settings.SCHEDULER_POLICY.get(
+        "MAX_CONSECUTIVE_INVIGILATOR_HOURS"
+    )
+    if limit_hours is None:
+        return [], 0
+    limit_minutes = float(limit_hours) * 60
+
+    rows = list(
+        InvigilatorAssignment.objects.filter(
+            assignment__run=run,
+            assignment__status=ScheduleAssignment.Status.ASSIGNED,
+        ).select_related("assignment")
+    )
+    by_invigilator_day = defaultdict(list)
+    for row in rows:
+        by_invigilator_day[(row.invigilator_id, row.assignment.start_at.date())].append(row.assignment)
+
+    violations = []
+    for (invigilator_id, _date), items in by_invigilator_day.items():
+        intervals = sorted((a.start_at, a.end_at) for a in items)
+        if not intervals:
+            continue
+        chain_start, chain_end = intervals[0]
+        for next_start, next_end in intervals[1:]:
+            if next_start > chain_end:
+                chain_start, chain_end = next_start, next_end
+            else:
+                chain_end = max(chain_end, next_end)
+            if (chain_end - chain_start).total_seconds() / 60 > limit_minutes:
+                violations.append(
+                    {
+                        "code": CODE.INVIGILATOR_CONSECUTIVE_LIMIT,
+                        "assignment": items[0],
+                        "entity_id": invigilator_id,
+                        "detail": (
+                            f"Consecutive work exceeds "
+                            f"{int(limit_minutes)}-minute limit."
+                        ),
+                    }
+                )
+                break
+    return violations, len(rows)
 
 
 def check_invigilator_availability(run):
@@ -404,11 +529,16 @@ def check_student_allocation_mismatch(run):
     for assignment in assignments:
         by_exam[assignment.exam_id].append(assignment)
     for exam_id, exam_assignments in by_exam.items():
+        exam_date = exam_assignments[0].start_at.date()
         expected = set(
             Enrollment.objects.filter(
                 course_id=exam_assignments[0].exam.course_id,
                 term=exam_assignments[0].exam.term,
                 status=Enrollment.Status.ACTIVE,
+                effective_from__lte=exam_date,
+            ).filter(
+                Q(effective_to__isnull=True)
+                | Q(effective_to__gte=exam_date)
             ).values_list("student_id", flat=True)
         )
         actual = set(
@@ -461,6 +591,9 @@ CHECKS = [
     ("missing_equipment", check_missing_equipment),
     ("room_double_booked", check_room_double_booking),
     ("invigilator_double_booked", check_invigilator_double_booking),
+    ("resource_status", check_resource_status),
+    ("invigilator_daily_limit", check_invigilator_daily_limits),
+    ("invigilator_consecutive_limit", check_invigilator_consecutive_limits),
     ("invigilator_unavailable", check_invigilator_availability),
     ("accommodation_violation", check_accommodation),
     ("room_unavailable", check_room_unavailable),

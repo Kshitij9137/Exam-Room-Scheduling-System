@@ -28,11 +28,35 @@ from apps.scheduling.models import (
 from apps.scheduling.services.conflict_graph import build_conflict_graph
 from apps.validation.models import DetectedViolation, ValidationRun
 
+from .permissions import can_run_actions
+
 logger = logging.getLogger(__name__)
 
 
 def latest_run() -> SchedulerRun | None:
     return SchedulerRun.objects.order_by("-run_id").first()
+
+
+def latest_baseline_run() -> SchedulerRun | None:
+    return (
+        SchedulerRun.objects.filter(
+            run_type=SchedulerRun.RunType.BASELINE,
+            status=SchedulerRun.Status.COMPLETED,
+        )
+        .order_by("-run_id")
+        .first()
+    )
+
+
+def latest_anomaly_run() -> SchedulerRun | None:
+    return (
+        SchedulerRun.objects.filter(
+            run_type=SchedulerRun.RunType.ANOMALY_FIXTURE,
+            status=SchedulerRun.Status.COMPLETED,
+        )
+        .order_by("-run_id")
+        .first()
+    )
 
 
 def latest_completed_run() -> SchedulerRun | None:
@@ -44,6 +68,13 @@ def latest_completed_run() -> SchedulerRun | None:
 
 
 def latest_validation(run: SchedulerRun | None = None) -> ValidationRun | None:
+    queryset = ValidationRun.objects.order_by("-validation_id")
+    if run is not None:
+        queryset = queryset.filter(scheduler_run=run)
+    return queryset.first()
+
+
+def latest_validation_for_run(run: SchedulerRun | None = None) -> ValidationRun | None:
     queryset = ValidationRun.objects.order_by("-validation_id")
     if run is not None:
         queryset = queryset.filter(scheduler_run=run)
@@ -91,8 +122,8 @@ def dashboard_summary() -> dict:
         "enrollments": Enrollment.objects.count(),
         "accommodations": Accommodation.objects.count(),
     }
-    run = latest_run()
-    validation = latest_validation(run) if run else None
+    run = latest_baseline_run()
+    validation = latest_validation_for_run(run) if run else None
     scorecard = load_scorecard()
     if scorecard and (
         validation is None
@@ -168,8 +199,8 @@ def timetable_rows(run: SchedulerRun, filters: dict | None = None) -> dict:
     return dict(sorted(grouped.items()))
 
 
-def exam_detail(exam: Exam) -> dict:
-    run = latest_completed_run()
+def exam_detail(exam: Exam, user=None) -> dict:
+    run = latest_baseline_run()
     context = {
         "exam": exam,
         "run": run,
@@ -211,7 +242,7 @@ def exam_detail(exam: Exam) -> dict:
         ScheduleEvent.objects.filter(run=run, exam=exam).order_by("event_id")
     )
 
-    if assignments:
+    if assignments and user is not None and can_run_actions(user):
         exam_date = assignments[0].start_at.date()
         active_accommodations = Accommodation.objects.filter(
             status=Accommodation.Status.ACTIVE,
@@ -276,7 +307,7 @@ def conflict_graph_data(top_n: int = 30) -> dict:
     selected = {exam_id for exam_id, _degree in top}
     exam_by_id = {exam.exam_id: exam for exam in exams}
     slot_by_exam = {}
-    run = latest_run()
+    run = latest_baseline_run()
     if run:
         for assignment in ScheduleAssignment.objects.filter(
             run=run, exam_id__in=selected

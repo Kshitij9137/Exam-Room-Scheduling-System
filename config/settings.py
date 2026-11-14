@@ -3,13 +3,26 @@ import os
 from pathlib import Path
 
 from django.contrib.messages import constants as message_constants
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Development key. Override with an environment variable in any real deployment.
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-insecure-key-change-me")
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
-ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = "dev-only-insecure-key-change-me"
+    else:
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0."
+        )
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get(
+        "DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1"
+    ).split(",")
+    if host.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",

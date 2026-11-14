@@ -3,8 +3,10 @@
 from collections import defaultdict
 
 from django.conf import settings
+from django.db.models import Q
 
 from apps.core.models import Enrollment
+from apps.scheduling.models import TimeSlot
 
 
 class ConflictGraph:
@@ -38,27 +40,54 @@ def build_conflict_graph(exams, term=None):
     graph = ConflictGraph(exams)
     exam_by_course = {exam.course_id: exam.exam_id for exam in graph.exams}
     students_by_exam = {exam.exam_id: set() for exam in graph.exams}
-    exams_by_student = defaultdict(set)
 
-    enrollments = (
-        Enrollment.objects.filter(
-            status=Enrollment.Status.ACTIVE,
-            term=term,
-            course_id__in=exam_by_course,
-        )
-        .order_by("student_id", "course_id")
-        .values_list("student_id", "course_id")
-        .iterator()
+    window_start = (
+        TimeSlot.objects.order_by("slot_date")
+        .values_list("slot_date", flat=True)
+        .first()
     )
-    for student_id, course_id in enrollments:
+    window_end = (
+        TimeSlot.objects.order_by("-slot_date")
+        .values_list("slot_date", flat=True)
+        .first()
+    )
+
+    enrollment_qs = Enrollment.objects.filter(
+        status=Enrollment.Status.ACTIVE,
+        term=term,
+        course_id__in=exam_by_course,
+    )
+    if window_start and window_end:
+        enrollment_qs = enrollment_qs.filter(
+            effective_from__lte=window_end,
+        ).filter(
+            Q(effective_to__isnull=True) | Q(effective_to__gte=window_start)
+        )
+
+    periods_by_student = defaultdict(lambda: defaultdict(list))
+    for student_id, course_id, effective_from, effective_to in (
+        enrollment_qs.order_by("student_id", "course_id")
+        .values_list(
+            "student_id", "course_id", "effective_from", "effective_to"
+        )
+        .iterator()
+    ):
         exam_id = exam_by_course[course_id]
         students_by_exam[exam_id].add(student_id)
-        exams_by_student[student_id].add(exam_id)
+        periods_by_student[student_id][exam_id].append(
+            (effective_from, effective_to)
+        )
 
-    for exam_ids in exams_by_student.values():
-        ordered_ids = sorted(exam_ids)
-        for index, first in enumerate(ordered_ids):
-            for second in ordered_ids[index + 1:]:
-                graph.add_edge(first, second)
+    for student_id, exam_periods in periods_by_student.items():
+        exam_ids = sorted(exam_periods)
+        for index, first in enumerate(exam_ids):
+            for second in exam_ids[index + 1:]:
+                if any(
+                    (first_end is None or first_end >= second_start)
+                    and (second_end is None or second_end >= first_start)
+                    for first_start, first_end in exam_periods[first]
+                    for second_start, second_end in exam_periods[second]
+                ):
+                    graph.add_edge(first, second)
 
     return graph, students_by_exam

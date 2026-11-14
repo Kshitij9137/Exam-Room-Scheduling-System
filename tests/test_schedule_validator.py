@@ -32,7 +32,7 @@ class ScheduleValidatorTests(TestCase):
 
         self.assertEqual(validation_run.status, ValidationRun.Status.PASSED)
         self.assertEqual(scorecard["failures"], 0)
-        self.assertEqual(len(scorecard["checks"]), 10)
+        self.assertEqual(len(scorecard["checks"]), 13)
         self.assertTrue(
             all(check["status"] == "PASS" for check in scorecard["checks"])
         )
@@ -42,6 +42,25 @@ class ScheduleValidatorTests(TestCase):
             ).count(),
             0,
         )
+
+    def test_same_exam_invigilator_in_two_rooms_is_double_booking(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        run = run_scheduler(seed=SEED_DEFAULT)
+        first = ScheduleAssignment.objects.filter(run=run).order_by("assignment_id").first()
+        exam_assignments = list(
+            ScheduleAssignment.objects.filter(run=run, exam=first.exam).order_by("assignment_id")
+        )
+        if len(exam_assignments) < 2:
+            self.skipTest("Baseline has no multi-room exam to exercise this path.")
+        shared_inv = InvigilatorAssignment.objects.filter(assignment=exam_assignments[0]).first()
+        self.assertIsNotNone(shared_inv)
+        InvigilatorAssignment.objects.get_or_create(
+            ias_id="IAS-999999",
+            assignment=exam_assignments[1],
+            invigilator=shared_inv.invigilator,
+        )
+        violations, _ = schedule_validator.check_invigilator_double_booking(run)
+        self.assertTrue(violations)
 
     def test_validation_run_is_persisted_with_finish_time(self):
         generate_and_persist(seed=SEED_DEFAULT, scale="starter")

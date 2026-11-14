@@ -24,7 +24,11 @@ demonstration system.
   schedule events. Run it before scheduling, or use a fresh local database.
 - The dashboard is read-only for general users; there are no custom CRUD
   screens. Internal record management belongs in Django admin.
-- Read-only dashboard pages are intentionally public for demonstration.
+- Read-only timetable and dashboard pages are intentionally public for
+  demonstration. Student lookup requires authentication; non-staff accounts
+  can only access the record matching their account email, while staff and
+  Academic Administrators can look up any student. Exam detail rosters and
+  accommodation details are restricted to staff and Academic Administrators.
   Mutating actions require an authenticated staff/superuser or an Academic
   Administrator group member and use POST with CSRF protection.
 
@@ -32,7 +36,13 @@ demonstration system.
 
 - The scheduler uses a deterministic DSatur ordering and greedy resource
   allocation. It is a heuristic and does not guarantee a globally optimal
-  schedule or maximize every soft preference.
+  schedule or maximize every soft preference. Soft rules S1/S2/S5 are
+  documented policy goals but are not implemented as active optimization
+  constraints in the current scheduler.
+- Per-student interval optimization is not implemented. The system does not
+  currently search for the best ordering of a student's exams within the same
+  day or across the exam window; it remains a documented limitation rather than
+  a claimed feature.
 - The generator and policy use a fixed 2026 exam calendar and one configured
   term. Supporting other academic calendars or multiple simultaneous terms
   requires changing configuration and reviewing identifier assumptions.

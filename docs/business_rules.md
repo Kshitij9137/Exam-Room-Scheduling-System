@@ -11,6 +11,8 @@
 | H5 | Invigilator is available for the whole interval and not double-booked | `INVIGILATOR_DOUBLE_BOOKED`, `INVIGILATOR_UNAVAILABLE` | `NO_INVIGILATOR` |
 | H6 | Accommodations are respected (extra time, separate room, accessible room) | `ACCOMMODATION_VIOLATION` | `ACCOMMODATION_UNSATISFIABLE` |
 | H7 | A room hosts only one exam at a time | `ROOM_DOUBLE_BOOKED` | `NO_FEASIBLE_ASSIGNMENT` |
+| H8 | Room and invigilator assignments must be active status | `INACTIVE_ROOM`, `INACTIVE_INVIGILATOR` | `NO_FEASIBLE_ASSIGNMENT` |
+| H9 | Invigilator daily and consecutive hours cannot exceed policy limits | `INVIGILATOR_DAILY_LIMIT`, `INVIGILATOR_CONSECUTIVE_LIMIT` | `NO_INVIGILATOR` |
 
 Additional integrity checks (also hard):
 
@@ -30,7 +32,19 @@ Additional integrity checks (also hard):
 | S4 | Balance invigilator workload |
 | S5 | Avoid more than 2 exams per student per day |
 
-## 3. Reason codes for unassigned exams
+## 3. Exam lifecycle and zero-enrollment policy
+
+| Status | Meaning | Next valid states |
+|---|---|---|
+| `DRAFT` | Not yet entered for scheduling | `PLANNED` |
+| `PLANNED` | Eligible to be scheduled | `SCHEDULED`, `UNASSIGNED`, `NOT_REQUIRED` |
+| `SCHEDULED` | Successfully assigned to one or more rooms | `PLANNED` |
+| `UNASSIGNED` | No feasible assignment found | `PLANNED` |
+| `NOT_REQUIRED` | The exam has no active enrollments and is intentionally excluded from coverage | `PLANNED` |
+
+An exam with no active enrollments is treated as `NOT_REQUIRED` rather than `SCHEDULED` and is not counted against coverage/failure rates. The scheduler records a `NOT_REQUIRED` schedule event with the no-enrollment reason.
+
+## 4. Reason codes for unassigned exams
 
 | Code | Meaning |
 |---|---|
@@ -74,6 +88,7 @@ for every fully scheduled exam: active_enrolled_students = allocated_students
 - Conflict checks use real intervals, not slot labels.
 - Hard buffer between exams (same student / room / invigilator): **0 minutes** by default; configurable.
 - Soft buffer for students (S1): 30 minutes.
+- Enrollment effective dates are treated as valid for the entire exam window when the graph and validators are built. In other words, an enrollment is active for a scheduled exam if `effective_from <= exam date` and (`effective_to` is null or `effective_to >= exam date`) for the actual exam date being evaluated.
 
 ## 6. Configurable policy assumptions
 
@@ -116,6 +131,9 @@ Only accommodations where `effective_from <= exam date` and (`effective_to` is n
 | `STUDENT_OVERLAP` | Moving an exam into a slot overlapping a connected exam | `STUDENT_DOUBLE_BOOKING` |
 | `CAPACITY_EXCEEDED` | Assigning an exam to a room smaller than its allocation | `ROOM_CAPACITY_EXCEEDED` |
 | `INVIGILATOR_CLASH` | Giving one invigilator two overlapping assignments | `INVIGILATOR_DOUBLE_BOOKED` |
+| `INACTIVE_RESOURCE` | Assigning a room or invigilator whose status is not active | `INACTIVE_ROOM`, `INACTIVE_INVIGILATOR` |
+| `DAILY_LIMIT_EXCEEDED` | Giving one invigilator more than their daily limit | `INVIGILATOR_DAILY_LIMIT` |
+| `CONSECUTIVE_LIMIT_EXCEEDED` | Assigning a long continuous stretch beyond the policy cap | `INVIGILATOR_CONSECUTIVE_LIMIT` |
 | `ACCOMMODATION_BREACH` | Cutting an extended-time student's interval short or using an unsuitable room | `ACCOMMODATION_VIOLATION` |
 | `ROOM_CLOSED` | Assigning an exam during a room closure | `ROOM_UNAVAILABLE_VIOLATION` |
 

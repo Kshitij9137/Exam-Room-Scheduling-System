@@ -5,6 +5,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.contrib import messages
+from django.contrib.auth.decorators import login_required
 from django.db import DatabaseError
 from django.shortcuts import redirect, render
 from django.urls import reverse
@@ -29,13 +30,14 @@ from apps.validation.services.exporter import (
 from apps.validation.services.validation_runner import run_all_checks
 
 from .forms import TimetableFilterForm
-from .permissions import staff_required
+from .permissions import can_run_actions, staff_required
 from .services import (
     conflict_graph_data,
     dashboard_summary,
     exam_detail,
     exceptions_rows,
-    latest_run,
+    latest_anomaly_run,
+    latest_baseline_run,
     timetable_rows,
     validation_page_data,
 )
@@ -46,7 +48,7 @@ def home(request):
 
 
 def timetable(request):
-    run = latest_run()
+    run = latest_baseline_run()
     if run is None:
         return render(
             request, "dashboard/no_latest_run.html", {"what": "timetable"}
@@ -83,26 +85,38 @@ def exam_detail_view(request, exam_id):
             {"what": f"exam {exam_id}"},
         )
     return render(
-        request, "dashboard/exam_detail.html", exam_detail(exam)
+        request,
+        "dashboard/exam_detail.html",
+        exam_detail(exam, user=request.user),
     )
 
 
+@login_required
 def student_lookup(request):
     query = (request.GET.get("q") or "").strip()
+    can_lookup_any_student = can_run_actions(request.user)
     student = None
     enrollments = []
     assignments = []
     if query:
-        student = Student.objects.filter(pk=query).first()
-        if student is None:
-            student = Student.objects.filter(email__iexact=query).first()
+        candidate = Student.objects.filter(pk=query).first()
+        if candidate is None:
+            candidate = Student.objects.filter(email__iexact=query).first()
+        if candidate and (
+            can_lookup_any_student
+            or (
+                request.user.email
+                and candidate.email.casefold() == request.user.email.casefold()
+            )
+        ):
+            student = candidate
         if student:
             enrollments = list(
                 student.enrollments.select_related("course")
                 .filter(status=Enrollment.Status.ACTIVE)
                 .order_by("course__course_code")
             )
-            run = latest_run()
+            run = latest_baseline_run()
             if run:
                 assignments = list(
                     ScheduleAssignment.objects.filter(
@@ -123,13 +137,14 @@ def student_lookup(request):
             "student": student,
             "enrollments": enrollments,
             "assignments": assignments,
-            "run": latest_run() if student else None,
+            "run": latest_baseline_run() if student else None,
+            "can_lookup_any_student": can_lookup_any_student,
         },
     )
 
 
 def exceptions(request):
-    run = latest_run()
+    run = latest_baseline_run()
     if run is None:
         return render(
             request, "dashboard/no_latest_run.html", {"what": "exceptions"}
@@ -209,7 +224,7 @@ def action_validate_data(request):
 
 @staff_required
 def action_validate_schedule(request):
-    run = latest_run()
+    run = latest_baseline_run()
     if run is None:
         messages.error(request, "No scheduler run to validate.")
         return redirect(_back(request))
@@ -258,13 +273,7 @@ def action_inject_anomalies(request):
 
 @staff_required
 def action_detect_violations(request):
-    run = (
-        SchedulerRun.objects.filter(
-            run_type=SchedulerRun.RunType.ANOMALY_FIXTURE
-        )
-        .order_by("-run_id")
-        .first()
-    )
+    run = latest_anomaly_run()
     if run is None:
         messages.error(
             request, "No ANOMALY_FIXTURE run exists; inject anomalies first."

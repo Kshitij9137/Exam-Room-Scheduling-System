@@ -4,6 +4,7 @@ from django.test import TestCase
 
 from apps.core.models import Course, Enrollment, Exam, Student
 from apps.core.services.id_generator import make_exam_id, make_id
+from apps.scheduling.models import TimeSlot
 from apps.scheduling.services.conflict_graph import build_conflict_graph
 from apps.scheduling.services.slot_allocator import color_exams
 from generator.config import TERM
@@ -43,14 +44,25 @@ class ConflictGraphTests(TestCase):
                 )
             )
 
-    def _enroll(self, index, student, course, *, status="ACTIVE", term=TERM):
+    def _enroll(
+        self,
+        index,
+        student,
+        course,
+        *,
+        status="ACTIVE",
+        term=TERM,
+        effective_from=dt.date(2026, 9, 1),
+        effective_to=None,
+    ):
         return Enrollment.objects.create(
             enrollment_id=make_id("enrollment", index),
             student=student,
             course=course,
             term=term,
             status=status,
-            effective_from=dt.date(2026, 9, 1),
+            effective_from=effective_from,
+            effective_to=effective_to,
         )
 
     def test_edge_weights_count_shared_active_students(self):
@@ -77,6 +89,60 @@ class ConflictGraphTests(TestCase):
         graph, students_by_exam = build_conflict_graph(self.exams, TERM)
         self.assertEqual(graph.edge_weight(self.exams[0].exam_id, self.exams[1].exam_id), 0)
         self.assertEqual(students_by_exam[self.exams[0].exam_id], set())
+
+    def test_partial_term_enrollment_is_included_and_conflicts_only_while_active(
+        self,
+    ):
+        TimeSlot.objects.create(
+            slot_id=make_id("slot", 1),
+            slot_date=dt.date(2026, 12, 7),
+            start_time=dt.time(8),
+        )
+        TimeSlot.objects.create(
+            slot_id=make_id("slot", 2),
+            slot_date=dt.date(2026, 12, 18),
+            start_time=dt.time(8),
+        )
+        self._enroll(
+            1,
+            self.students[0],
+            self.courses[0],
+            effective_from=dt.date(2026, 12, 10),
+            effective_to=dt.date(2026, 12, 12),
+        )
+        self._enroll(
+            2,
+            self.students[0],
+            self.courses[1],
+            effective_from=dt.date(2026, 12, 12),
+            effective_to=dt.date(2026, 12, 15),
+        )
+        self._enroll(
+            3,
+            self.students[0],
+            self.courses[2],
+            effective_from=dt.date(2026, 12, 13),
+            effective_to=dt.date(2026, 12, 15),
+        )
+
+        graph, students_by_exam = build_conflict_graph(self.exams, TERM)
+
+        self.assertEqual(
+            students_by_exam[self.exams[0].exam_id],
+            {self.students[0].student_id},
+        )
+        self.assertEqual(
+            graph.edge_weight(
+                self.exams[0].exam_id, self.exams[1].exam_id
+            ),
+            1,
+        )
+        self.assertEqual(
+            graph.edge_weight(
+                self.exams[0].exam_id, self.exams[2].exam_id
+            ),
+            0,
+        )
 
     def test_dsatur_colors_conflicting_exams_into_different_time_groups(self):
         self._enroll(1, self.students[0], self.courses[0])

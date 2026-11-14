@@ -8,9 +8,10 @@ class InvalidTransition(ValueError):
 ALLOWED_TRANSITIONS = {
     "Exam": {
         "DRAFT": {"PLANNED"},
-        "PLANNED": {"SCHEDULED", "UNASSIGNED"},
+        "PLANNED": {"SCHEDULED", "UNASSIGNED", "NOT_REQUIRED"},
         "SCHEDULED": {"PLANNED"},      # reset when the scheduler is re-run
         "UNASSIGNED": {"PLANNED"},     # reset when the scheduler is re-run
+        "NOT_REQUIRED": {"PLANNED"},   # reset when the scheduler is re-run
     },
     "Enrollment": {
         "ACTIVE": {"DROPPED", "WITHDRAWN", "COMPLETED"},
