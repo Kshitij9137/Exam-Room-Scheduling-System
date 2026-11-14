@@ -87,7 +87,7 @@ The run suffix is added to the required `ASN-<exam-id>-<room-id>` pattern so two
 ## 4. Lifecycle states
 
 ```
-Exam:           DRAFT -> PLANNED -> SCHEDULED
+Exam:           DRAFT -> PLANNED -> SCHEDULED  (SCHEDULED -> PLANNED on re-run)
                               \-> UNASSIGNED          (UNASSIGNED -> PLANNED on re-run)
 Enrollment:     ACTIVE -> DROPPED | WITHDRAWN | COMPLETED
 ScheduleAssignment: ASSIGNED -> SUPERSEDED | CANCELLED
