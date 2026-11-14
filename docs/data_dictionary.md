@@ -84,7 +84,7 @@ Unique together: (building, room_number).
 |---|---|---|---|---|---|---|
 | capacity_id | Char(10) PK | Y | `CAP-\d{6}` | | Y | regex |
 | room | FK Room | Y | existing room_id | | | FK exists |
-| exam_capacity | SmallInt | Y | 10-500 | seat | N | >= 1 |
+| exam_capacity | SmallInt | Y | 10-500 | seat | N | 10 <= v <= 500 |
 | effective_from | Date | Y | | date | | |
 | effective_to | Date | N | | date | | null or >= effective_from; no overlap per room |
 
@@ -163,3 +163,17 @@ Unique together: (run, exam, room). All rooms of one exam in a run share the sam
 
 `data/ground_truth.csv` columns: `anomaly_id, issue_type, assignment_id, affected_entity_id, expected_violation_code`.
 It is read only by the evaluator after detection finishes.
+
+## Phase 3 generation assumptions
+
+- The default seed is `20261022`; `starter` creates 200 students, 30 courses,
+  20 exams, 15 rooms, and 25 invigilators. `full` creates 5,000 students,
+  300 courses/exams, 100 rooms, and 200 invigilators.
+- Each course has at most one exam in a term. Starter scale intentionally leaves
+  ten courses without an exam; only courses with an exam receive enrollments.
+- Each student is enrolled in 4-6 exam courses. Enrollment counts are derived
+  from the bridge rows rather than stored separately.
+- Generated identities are deterministic counters. Timestamps use the fixed
+  UTC exam calendar; no external or personal data is used.
+- Assignment-linked anomaly labels are produced with the isolated anomaly
+  fixture in the later validation phase, not mixed into this clean baseline.

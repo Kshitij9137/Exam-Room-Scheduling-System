@@ -1,0 +1,41 @@
+{
+  "seed": 20261022,
+  "scale": "full",
+  "checksum_run_1": "0d9535f6b08ee3546b61ff50140d17f1da73e2349937dc6f1c358491696d5b6f",
+  "checksum_run_2": "0d9535f6b08ee3546b61ff50140d17f1da73e2349937dc6f1c358491696d5b6f",
+  "row_counts_run_1": {
+    "core_equipment": 5,
+    "core_student": 5000,
+    "core_course": 300,
+    "core_room": 100,
+    "core_invigilator": 200,
+    "scheduling_timeslot": 40,
+    "core_roomcapacity": 100,
+    "core_roomequipment": 193,
+    "scheduling_availability": 1186,
+    "scheduling_roomclosure": 5,
+    "core_accommodation": 450,
+    "core_enrollment": 24959,
+    "core_exam": 300,
+    "core_examrequirement": 300,
+    "core_examrequirementequipment": 297
+  },
+  "row_counts_run_2": {
+    "core_equipment": 5,
+    "core_student": 5000,
+    "core_course": 300,
+    "core_room": 100,
+    "core_invigilator": 200,
+    "scheduling_timeslot": 40,
+    "core_roomcapacity": 100,
+    "core_roomequipment": 193,
+    "scheduling_availability": 1186,
+    "scheduling_roomclosure": 5,
+    "core_accommodation": 450,
+    "core_enrollment": 24959,
+    "core_exam": 300,
+    "core_examrequirement": 300,
+    "core_examrequirementequipment": 297
+  },
+  "match": true
+}

@@ -1,0 +1,179 @@
+{
+  "counts": {
+    "students": 5000,
+    "courses": 300,
+    "exams": 300,
+    "rooms": 100,
+    "invigilators": 200,
+    "enrollments": 24959,
+    "active_enrollments": 24959,
+    "accommodations": 450,
+    "room_capacities": 100,
+    "availability": 1186,
+    "room_closures": 5,
+    "timeslots": 40,
+    "equipment": 5,
+    "room_equipment": 193,
+    "exam_requirement_equipment": 297
+  },
+  "checks": [
+    {
+      "check": "invalid_foreign_keys",
+      "failures": 0
+    },
+    {
+      "check": "exams_have_course",
+      "failures": 0
+    },
+    {
+      "check": "exams_have_requirement",
+      "failures": 0
+    },
+    {
+      "check": "rooms_have_capacity",
+      "failures": 0
+    },
+    {
+      "check": "accommodations_have_student",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_enrollments",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_primary_keys",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_exam_per_course",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_student_email",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_invigilator_email",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_course_code",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_room_building_number",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_timeslot",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_room_equipment",
+      "failures": 0
+    },
+    {
+      "check": "duplicate_requirement_equipment",
+      "failures": 0
+    },
+    {
+      "check": "enrollments_point_to_courses_with_exam",
+      "failures": 0
+    },
+    {
+      "check": "active_enrollment_student_is_active",
+      "failures": 0
+    },
+    {
+      "check": "student_course_load_4_to_6",
+      "failures": 0
+    },
+    {
+      "check": "capacity_out_of_range",
+      "failures": 0
+    },
+    {
+      "check": "room_capacity_dates_ordered",
+      "failures": 0
+    },
+    {
+      "check": "room_capacity_ranges_overlap",
+      "failures": 0
+    },
+    {
+      "check": "enrollment_dates_ordered",
+      "failures": 0
+    },
+    {
+      "check": "accommodation_dates_ordered",
+      "failures": 0
+    },
+    {
+      "check": "availability_dates_ordered",
+      "failures": 0
+    },
+    {
+      "check": "room_closure_dates_ordered",
+      "failures": 0
+    },
+    {
+      "check": "accommodation_percent_matches_type",
+      "failures": 0
+    },
+    {
+      "check": "availability_has_exactly_one_target",
+      "failures": 0
+    },
+    {
+      "check": "exam_duration_invalid",
+      "failures": 0
+    },
+    {
+      "check": "exam_id_year_mismatch",
+      "failures": 0
+    },
+    {
+      "check": "invalid_course_code",
+      "failures": 0
+    },
+    {
+      "check": "invalid_equipment_code",
+      "failures": 0
+    },
+    {
+      "check": "invalid_generated_ids",
+      "failures": 0
+    },
+    {
+      "check": "invalid_enum_values",
+      "failures": 0
+    },
+    {
+      "check": "invalid_exam_requirement_ratio",
+      "failures": 0
+    },
+    {
+      "check": "invalid_course_credits",
+      "failures": 0
+    },
+    {
+      "check": "invalid_student_year_level",
+      "failures": 0
+    },
+    {
+      "check": "invalid_invigilator_daily_hours",
+      "failures": 0
+    },
+    {
+      "check": "invalid_term_format",
+      "failures": 0
+    },
+    {
+      "check": "active_enrollment_reconciliation",
+      "failures": 0
+    }
+  ],
+  "failures": 0,
+  "ok": true
+}

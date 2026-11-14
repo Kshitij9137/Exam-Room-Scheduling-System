@@ -1,0 +1,1554 @@
+
+
+Problem statement
+Read it carefully. Your build should cover every point below.
+
+Business Context / Problem
+Schedule exams and rooms while respecting student enrollment, room capacity, accommodations and invigilator availability.
+
+Objective and Scope
+Build a working solution for this end-to-end workflow: Schedule exams and rooms while respecting student enrollment, room capacity, accommodations and invigilator availability. The solution should expose key decisions and exceptions, preserve traceability, and produce measurable outputs. Medium complexity means multiple related entities, conditional rules, at least one exception path and meaningful evaluation metrics.
+
+Primary Actors / Systems
+Learner, instructor, academic administrator, support staff and platform administrator
+
+Business Workflow and Rules
+1. Generate/reference master data first: Student, Course, Enrollment, Exam, ExamRequirement.
+2. Generate dependent transaction/event records using valid parent IDs.
+3. Apply business logic: Create student-course enrollments; generate exams and duration requirements; define rooms, capacities and equipment; define invigilator availability and accommodation constraints; build conflict graph; assign rooms/times; report unassigned exams and reason codes.
+4. Persist state changes as explicit records/events where relevant; do not overwrite history.
+5. Generate outcomes and ground-truth labels from documented rules, not independent random assignment.
+
+Entities and Relationships
+Core entities: Student, Course, Enrollment, Exam, ExamRequirement, Room, RoomCapacity, Invigilator, Availability, Accommodation, ScheduleAssignment. Define a primary key for every entity and foreign keys for every relationship. Document cardinality (1:1, 1:N, N:M), optional relationships, effective dates and lifecycle states. Use bridge tables for many-to-many relationships; retain event history for state changes; validate all joins. For deliberate anomaly cases, keep an issue_type/ground_truth label rather than silently corrupting unrelated rows.
+
+ID / Nomenclature Conventions
+STU-000001; EXAM-2026-000001; ROOM-000001; INV-000001; ASN-<exam-id>-<room-id>.
+
+Synthetic Data Generation Instructions (Granular)
+Step 1 — Write a data dictionary for: Student, Course, Enrollment, Exam, ExamRequirement, Room, RoomCapacity, Invigilator, Availability, Accommodation, ScheduleAssignment. For each field specify type, required/optional, allowed values, units, uniqueness and validation rule.
+Step 2 — Create parent/master tables first, then child and event tables. Apply this domain-specific generation logic: Create student-course enrollments; generate exams and duration requirements; define rooms, capacities and equipment; define invigilator availability and accommodation constraints; build conflict graph; assign rooms/times; report unassigned exams and reason codes.
+Step 3 — Apply deterministic IDs and naming: STU-000001; EXAM-2026-000001; ROOM-000001; INV-000001; ASN-<exam-id>-<room-id>. Keep counters zero-padded, IDs immutable, and referenced IDs exactly consistent across files.
+Step 4 — Generate the baseline volume: Generate 5,000 students, 300 exams, 100 rooms and 200 invigilators. Include overlapping enrollment conflicts, room closures, special equipment and extended-duration accommodations. Use a fixed seed (e.g. 20261022) and parameterize scale so starter and full datasets use the same generator.
+Step 5 — Generate valid baseline records first, then inject labelled edge cases: Student has overlapping exams; room capacity exceeded; invigilator double-booked; accommodation ignored; exam outside room availability.
+Step 6 — Calculate derived values (totals, balances, scores, statuses and dates) from source records rather than generating them independently.
+Step 7 — Produce a separate ground_truth.csv/json for known anomalies, expected decisions or labels; never leak it into input features.
+Step 8 — Run validation: primary-key uniqueness, foreign-key integrity, allowed enums, date ordering, arithmetic reconciliation, lifecycle transitions and duplicate checks.
+Step 9 — Export CSV/JSON/SQL seed data plus README, schema/data dictionary, generator command, fixed seed, source manifest and validation summary.
+Step 10 — Regenerate twice with the same seed and compare row counts/checksums to demonstrate reproducibility.
+
+Suggested Volume and Coverage
+Generate 5,000 students, 300 exams, 100 rooms and 200 invigilators. Include overlapping enrollment conflicts, room closures, special equipment and extended-duration accommodations.
+
+Required Edge Cases / Negative Scenarios
+Student has overlapping exams; room capacity exceeded; invigilator double-booked; accommodation ignored; exam outside room availability.
+
+Validation Rules / Acceptance Criteria
+No hard constraint is violated; every unscheduled item has a reason; room and invigilator usage reconcile; accommodations are applied consistently.
+
+Evaluation Focus for Generated Data
+Review: (a) realistic distributions and meaningful variation; (b) consistent IDs and valid joins; (c) dependency/lifecycle consistency across entities; (d) correct derived values and reconciliation; (e) normal, boundary, failure and exception coverage; (f) separate ground truth; (g) fixed-seed reproducibility, documentation and lawful provenance.
+
+Public Data Guidance / Lawful Use
+External data is optional. If used, record source URL, dataset/version, retrieval date, license/terms, attribution, transformations and fields discarded. Use only data you are legally permitted to access and redistribute; do not bypass access controls or collect confidential/personal information. If licensing or suitability is unclear, use synthetic data and cite public reference data only for schema inspiration.
+
+
+Plan :
+
+# **Final Merged Development Plan: Exam & Room Scheduling System**
+
+
+
+Recommended final blueprint
+
+7 development phases
+
+
+
+**Technology stack:** Python · Django · Django Templates · Bootstrap 5 · JavaScript · SQLite
+
+**Project objective:** Build a complete, reproducible and explainable university examination scheduling system that automatically assigns examinations to suitable time slots, rooms and invigilators while respecting student enrollment, room capacity, equipment, availability and student accommodations.
+
+This plan uses **Plan 2 as the main development roadmap**, incorporating Plan 1's three-tier architecture and dashboard, and Plan 3's traceability, decision explanations and constraint scorecard.
+
+The seven phases are arranged in implementation order, starting with database design and ending with testing, reproducibility and final demonstration.
+
+# **1. System Architecture — Three-Tier Architecture**
+
+The application must follow a clear separation between presentation, business logic and data storage.
+
+**TIER 1 — PRESENTATION**
+
+Frontend
+
+**Django Templates + Bootstrap 5 + JavaScript**
+
+- Executive dashboard
+- Examination timetable
+- Exam details and allocation explanations
+- Student lookup
+- Exceptions and validation reports
+- Conflict graph visualization
+- Role-based interface
+
+HTTP requests and responses
+
+**TIER 2 — APPLICATION**
+
+Backend
+
+**Django Views + Forms + Python Services**
+
+- Synthetic data generator
+- Conflict graph engine
+- Scheduling algorithm
+- Room allocation engine
+- Invigilator allocation engine
+- Accommodation processor
+- Independent validation engine
+- Anomaly detection and evaluation
+- Audit and reporting services
+
+Django ORM and transactions
+
+**TIER 3 — DATA**
+
+Database
+
+**SQLite + Django ORM**
+
+- 11 required domain entities
+- Supporting relational entities
+- Scheduling runs and assignments
+- Event and audit history
+- Validation reports
+- CSV/JSON exports
+- Separate ground-truth evaluation artifacts
+
+### **Architectural principles**
+
+1. Django Templates must only handle presentation.
+2. Django Views must handle HTTP requests and responses, not scheduling algorithms.
+3. Business rules must reside in reusable Python service modules.
+4. Management commands and frontend actions must call the same service functions.
+5. Every scheduling execution must be independently identifiable.
+6. Historical assignments and events must never be silently overwritten.
+7. The scheduler must not access the ground-truth labels.
+8. All important decisions and exceptions must be explainable.
+
+You do not need Django REST Framework, React, Celery or PostgreSQL for this implementation. A single Django application can implement all three logical tiers.
+
+# **2. Detailed Development Roadmap**
+
+## **Phase 1 — Foundation, Requirements Analysis and Database Design**
+
+Highest priority
+
+**Goal:** Understand the business problem, define the architecture and design a reliable relational database before implementing the scheduling algorithm.
+
+This phase is the foundation of the entire project. A mistake in the relationships between students, courses, exams and assignments can affect every later phase.
+
+### **Subphase 1.1 — Understand the business workflow**
+
+First, understand the complete examination scheduling process.
+
+```
+Students + Courses
+        |
+        v
+   Enrollments
+        |
+        v
+     Exams
+        |
+        v
+ Exam Requirements
+        |
+        v
+Rooms + Capacities + Equipment
+        |
+        v
+Availability + Accommodations
+        |
+        v
+  Conflict Graph
+        |
+        v
+ Scheduling Algorithm
+        |
+        v
+Room + Time + Invigilator Allocation
+        |
+        v
+Assignments / Unassigned Exams
+        |
+        v
+Validation + Reports
+```
+
+Identify the five actors and their responsibilities:
+
+| Actor                  | Responsibility                                              |
+| ---------------------- | ----------------------------------------------------------- |
+| Learner                | View personal examination timetable                         |
+| Instructor             | View relevant courses and examinations                      |
+| Academic Administrator | Generate data, schedule examinations and resolve exceptions |
+| Support Staff          | Manage accommodation and accessibility information          |
+| Platform Administrator | Manage users, permissions and platform settings             |
+
+### **Subphase 1.2 — Define business rules**
+
+Write every rule in a separate document before coding.
+
+**Hard constraints — must never be violated:**
+
+| Rule | Description                                                |
+| ---- | ---------------------------------------------------------- |
+| H1   | A student cannot have two overlapping examinations         |
+| H2   | Allocated students cannot exceed room capacity             |
+| H3   | Required room equipment must be available                  |
+| H4   | Rooms must be available throughout the examination         |
+| H5   | Invigilators must be available and cannot be double-booked |
+| H6   | Student accommodations must be respected                   |
+| H7   | A room cannot host overlapping examinations                |
+
+**Soft constraints — improve scheduling quality:**
+
+- Avoid back-to-back examinations for students.
+- Distribute examinations across available days.
+- Minimize unnecessary room-capacity wastage.
+- Balance invigilator workloads.
+- Avoid excessively long examination days.
+
+Soft constraints may influence the quality of the schedule but must never override hard constraints.
+
+Document assumptions such as examination periods, slot lengths, transition buffers, invigilator staffing ratios and accommodation policies. These are configurable university policies, not fixed values supplied by the problem statement.
+
+### **Subphase 1.3 — Design the database schema**
+
+Implement all 11 required entities.
+
+| Entity             | Important fields                                                                     | Relationship            |
+| ------------------ | ------------------------------------------------------------------------------------ | ----------------------- |
+| Student            | student_id, name, email, department, year_level, status                              | 1:N Enrollment          |
+| Course             | course_id, course_code, title, department, credits                                   | 1:N Enrollment          |
+| Enrollment         | enrollment_id, student_id, course_id, term, status                                   | N:1 Student and Course  |
+| Exam               | exam_id, course_id, title, duration_minutes, status                                  | N:1 Course              |
+| ExamRequirement    | requirement_id, exam_id, equipment, accessibility requirements                       | 1:1 Exam                |
+| Room               | room_id, building, room_number, capacity-related properties, status                  | 1:N RoomCapacity        |
+| RoomCapacity       | capacity_id, room_id, capacity, effective dates                                      | N:1 Room                |
+| Invigilator        | invigilator_id, name, email, max_daily_hours                                         | 1:N Availability        |
+| Availability       | availability_id, room_id or invigilator_id, start_at, end_at                         | N:1 Room or Invigilator |
+| Accommodation      | accommodation_id, student_id, extra_time_percent, room requirements, effective dates | N:1 Student             |
+| ScheduleAssignment | assignment_id, run_id, exam_id, room_id, start_at, end_at, allocated count, status   | N:1 Exam and Room       |
+
+For `Availability`, use two nullable foreign keys (`room_id` and `invigilator_id`) with a database constraint requiring exactly one to be populated. This keeps actual foreign-key integrity without a generic `target_id`.
+
+Add the following supporting entities:
+
+| Supporting entity     | Purpose                                           |
+| --------------------- | ------------------------------------------------- |
+| RoomClosure           | Track temporary room closures                     |
+| TimeSlot              | Define valid examination slots                    |
+| SchedulerRun          | Record every scheduling execution                 |
+| ScheduleEvent         | Maintain append-only decision and change history  |
+| InvigilatorAssignment | Connect multiple invigilators to room assignments |
+| StudentRoomAllocation | Track the exact room allocated to each student    |
+| UnassignedExam        | Store unscheduled exam details and reason codes   |
+| ValidationRun         | Store independent validation executions           |
+| DetectedViolation     | Store the actual violations detected              |
+
+**Important relationship decisions:**
+
+- Student and Course have an N:M relationship through Enrollment.
+- Exam and Room can have an N:M relationship through ScheduleAssignment.
+- One exam may require multiple rooms.
+- One room allocation may have multiple invigilators.
+- Every allocated student must be linked to an actual room allocation.
+- Each scheduling run must preserve its own assignment records.
+
+For multiple-room support, create one `ScheduleAssignment` record per exam-room allocation. All room allocations for the same exam within a run must be consistent with its planned start time. A separate `UnassignedExam` record should be created when a complete feasible allocation cannot be made.
+
+### **Subphase 1.4 — Define ID conventions and lifecycle rules**
+
+Use deterministic, zero-padded identifiers:
+
+```
+STU-000001
+CRS-000001
+ENR-000001
+EXAM-2026-000001
+ROOM-000001
+INV-000001
+ASN-EXAM-2026-000001-ROOM-000001-RUN-000001
+RUN-000001
+```
+
+The assignment ID extends the requested assignment naming convention with a run identifier so that historical records cannot collide.
+
+Generate these IDs in dedicated service functions, not in `Model.save()`.
+
+Define lifecycle states, for example:
+
+```
+Exam:
+DRAFT → PLANNED → SCHEDULED
+                    |
+                    v
+                UNASSIGNED
+
+Assignment:
+ASSIGNED → SUPERSEDED
+         → CANCELLED
+```
+
+Historical records should remain available.
+
+### **Subphase 1.5 — Create documentation and ER diagram**
+
+Create:
+
+```
+docs/
+    architecture.md
+    data_dictionary.md
+    er_diagram.md
+    business_rules.md
+```
+
+Your data dictionary must document each field's type, whether it is required, allowed values, units, uniqueness and validation rules.
+
+**Expected deliverables:**
+
+- Three-tier architecture diagram.
+- ER diagram.
+- Data dictionary covering all 11 mandatory entities.
+- Relationship and cardinality documentation.
+- Hard and soft constraint documentation.
+- ID conventions and lifecycle definitions.
+
+**Completion criteria:** You can explain every database relationship and business rule before starting the scheduler.
+
+## **Phase 2 — Django Project Setup and Relational Database Implementation**
+
+**Goal:** Build a working Django application with the complete database structure, migrations, constraints and administrative access.
+
+### **Subphase 2.1 — Set up the project**
+
+Create the Django project and organize the applications.
+
+```
+django-admin startproject config .
+```
+
+Create these Django apps:
+
+```
+python manage.py startapp core
+python manage.py startapp scheduling
+python manage.py startapp validation
+python manage.py startapp dashboard
+```
+
+Optionally create an `accounts` app if you need customized user management.
+
+Configure:
+
+- SQLite database.
+- Django templates.
+- Static files.
+- Bootstrap 5.
+- Authentication and permissions.
+- Timezone-aware date/time handling.
+- Application logging.
+
+### **Subphase 2.2 — Implement Django models**
+
+Translate the Phase 1 database design into Django models.
+
+Example:
+
+```
+class Student(models.Model):    student_id = models.CharField(        primary_key=True,        max_length=20    )    name = models.CharField(max_length=150)    email = models.EmailField(unique=True)    department = models.CharField(max_length=100)    year_level = models.PositiveSmallIntegerField()    status = models.CharField(        max_length=20,        choices=[            ("ACTIVE", "Active"),            ("INACTIVE", "Inactive"),        ],        default="ACTIVE",    )
+```
+
+Follow the same approach for every entity.
+
+Implement:
+
+- Foreign keys.
+- Unique constraints.
+- Check constraints.
+- Many-to-many bridge tables.
+- Required and optional fields.
+- Effective-date fields.
+- Lifecycle status fields.
+- Database indexes for frequently queried columns.
+
+Remember that Django's `save()` method does not automatically call `full_clean()`. Enforce validation at the form and service layers as well.
+
+### **Subphase 2.3 — Run migrations**
+
+```
+python manage.py makemigrations
+python manage.py migrate
+```
+
+Register all models in `admin.py`.
+
+Configure useful admin features:
+
+- Search.
+- Filters.
+- Read-only historical fields.
+- Related object inlines.
+- Pagination.
+- Date filters.
+
+### **Subphase 2.4 — Create preliminary model tests**
+
+Test:
+
+- Primary key uniqueness.
+- Foreign key integrity.
+- Duplicate enrollments.
+- Invalid capacities.
+- Invalid date ranges.
+- Invalid examination durations.
+- Invalid lifecycle transitions.
+
+Use Django's `TestCase` and its test database.
+
+**Expected deliverables:**
+
+- Working Django project.
+- Complete relational schema.
+- Successful migrations.
+- Configured Django Admin.
+- Initial model test suite.
+
+**Completion criteria:** All required entities exist, their relationships are correct and database-level constraints are working.
+
+## **Phase 3 — Synthetic Data Generation and Data Quality Validation**
+
+Mandatory problem requirement
+
+**Goal:** Generate realistic, deterministic synthetic data at both starter and full scale, then validate it before scheduling.
+
+The problem statement explicitly requires 5,000 students, 300 exams, 100 rooms and 200 invigilators, along with labelled edge cases, reproducibility and exports.&#x20;
+
+plans.txt
+
+
+
+### **Subphase 3.1 — Build a configurable data generator**
+
+Create:
+
+```
+generator/
+    config.py
+    master_data.py
+    enrollments.py
+    anomalies.py
+```
+
+Support two scales:
+
+| Entity       | Starter | Full  |
+| ------------ | ------- | ----- |
+| Students     | 200     | 5,000 |
+| Courses      | 30      | 300   |
+| Exams        | 20      | 300   |
+| Rooms        | 15      | 100   |
+| Invigilators | 25      | 200   |
+
+The course count is a configurable example: for a one-exam-per-course examination cycle, one course per exam is a reasonable model. Document the chosen assumption.
+
+Use a fixed seed:
+
+```
+20261022
+```
+
+Example:
+
+```
+python manage.py generate_data \
+    --seed 20261022 \
+    --scale starter
+```
+
+Full dataset:
+
+```
+python manage.py generate_data \
+    --seed 20261022 \
+    --scale full
+```
+
+### **Subphase 3.2 — Generate records in dependency order**
+
+Always create parent records before dependent records.
+
+1. Generate Students, Courses, Rooms, Invigilators and TimeSlots.
+2. Generate RoomCapacity, Availability, RoomClosure and Accommodations.
+3. Generate Student-Course Enrollments.
+4. Generate Exams and ExamRequirements.
+5. Calculate active enrollment totals from actual enrollment records.
+6. Validate the complete baseline dataset.
+
+### **Subphase 3.3 — Implement realistic distributions**
+
+Do not generate all records with identical properties.
+
+Examples:
+
+- Students enroll in approximately 4–6 courses.
+- A few courses are highly popular.
+- Most students select courses within their department.
+- Room capacity varies from small classrooms to large examination halls.
+- Rooms have different equipment combinations.
+- Some rooms have temporary closures.
+- Invigilators have different availability periods.
+- A defined percentage of students have accommodation requirements.
+
+For accommodations, include different extra-time percentages and room requirements.
+
+Use a deterministic random generator:
+
+```
+import randomrng = random.Random(seed)student_count = rng.randint(4, 6)
+```
+
+Use this seeded generator consistently throughout the generation pipeline. If using Faker, initialize its random seed too.
+
+Avoid `datetime.now()` for generated records. Use fixed examination calendar dates or dates derived from a defined seed-based start date.
+
+### **Subphase 3.4 — Use batch database insertion**
+
+For large synthetic datasets, use Django's `bulk_create()`.
+
+```
+Student.objects.bulk_create(    student_objects,    batch_size=1000)
+```
+
+Remember that bulk insertion bypasses model `save()` methods and save signals. Therefore, generate IDs and perform validation explicitly before insertion.
+
+### **Subphase 3.5 — Build the data validation engine**
+
+Create:
+
+```
+apps/validation/services/data_validator.py
+```
+
+Check:
+
+| Validation                | Expected |
+| ------------------------- | -------- |
+| Duplicate primary keys    | 0        |
+| Invalid foreign keys      | 0        |
+| Invalid enum values       | 0        |
+| Invalid date ranges       | 0        |
+| Duplicate enrollments     | 0        |
+| Invalid room capacities   | 0        |
+| Enrollment reconciliation | Pass     |
+| Invalid lifecycle states  | 0        |
+| Invalid generated IDs     | 0        |
+
+Command:
+
+```
+python manage.py validate_data
+```
+
+Produce:
+
+```
+data/validation_summary.json
+```
+
+### **Subphase 3.6 — Export and reproduce the data**
+
+Create:
+
+```
+python manage.py export_data
+```
+
+Exports:
+
+```
+data/exports/
+    students.csv
+    courses.csv
+    enrollments.csv
+    exams.csv
+    rooms.csv
+    invigilators.csv
+    accommodations.csv
+    availability.csv
+```
+
+Also support JSON and SQL seed exports.
+
+Build a reproducibility command:
+
+```
+python manage.py verify_reproducibility \
+    --seed 20261022
+```
+
+Compare row counts and SHA-256 checksums from two isolated runs. Sort records consistently before calculating hashes.
+
+**Expected deliverables:**
+
+- Deterministic synthetic data generator.
+- Starter and full datasets.
+- Data dictionary alignment.
+- Validation command and JSON summary.
+- CSV/JSON/SQL exports.
+- Reproducibility report.
+
+**Completion criteria:** The full dataset meets the required volume, contains valid relationships and produces identical canonical exports when regenerated with the same seed.
+
+## **Phase 4 — Core Scheduling Engine and Conflict Resolution**
+
+Most important technical phase
+
+**Goal:** Build the actual scheduling engine that allocates exams while respecting all hard constraints.
+
+Keep scheduling algorithms in plain Python services. This makes them independently testable and reusable from both Django views and management commands.
+
+### **Subphase 4.1 — Build the conflict graph**
+
+Represent examinations as graph vertices.
+
+Two examinations are connected when at least one student is enrolled in both.
+
+Example:
+
+```
+       EXAM-001
+       /     \
+  EXAM-002  EXAM-003
+       \     /
+       EXAM-004
+```
+
+The edge weight should represent the number of shared students.
+
+Create:
+
+```
+apps/scheduling/services/conflict_graph.py
+```
+
+The graph should be generated using active enrollments only.
+
+### **Subphase 4.2 — Implement exam ordering using DSatur**
+
+Use the DSatur graph-coloring heuristic.
+
+The algorithm prioritizes examinations by:
+
+1. Highest saturation degree.
+2. Highest conflict degree.
+3. Largest student enrollment.
+4. Most restrictive room and equipment requirements.
+
+Each color represents an examination time group.
+
+Exams connected by an edge must receive different, non-overlapping time groups.
+
+Implement this in plain Python first. NetworkX is optional, not mandatory.
+
+### **Subphase 4.3 — Implement candidate time-slot selection**
+
+Create:
+
+```
+apps/scheduling/services/slot_allocator.py
+```
+
+For every exam:
+
+- Identify eligible dates and candidate slots.
+- Check student conflicts.
+- Confirm the slot can accommodate examination duration.
+- Include required accommodation time.
+- Respect operating hours and time buffers.
+- Try another candidate if the current one is infeasible.
+
+Use actual time intervals, not just slot labels, for final conflict validation.
+
+### **Subphase 4.4 — Implement room allocation**
+
+Create:
+
+```
+apps/scheduling/services/room_allocator.py
+```
+
+Check:
+
+- Room is active.
+- Capacity is sufficient.
+- Required equipment is available.
+- Accessibility requirements are satisfied.
+- Room availability covers the entire allocation.
+- No closure overlaps the allocation.
+- Room is not already occupied by another exam.
+
+Use best-fit allocation: choose the smallest suitable room or combination of rooms that can accommodate the students.
+
+Support multiple rooms for a single examination.
+
+Use `StudentRoomAllocation` to identify exactly which students are assigned to each room.
+
+### **Subphase 4.5 — Implement accommodation handling**
+
+Create:
+
+```
+apps/scheduling/services/accommodation.py
+```
+
+Example:
+
+| Examination | Accommodation | Required duration |
+| ----------- | ------------- | ----------------- |
+| 120 minutes | None          | 120 minutes       |
+| 120 minutes | 25% extra     | 150 minutes       |
+| 120 minutes | 50% extra     | 180 minutes       |
+| 120 minutes | 100% extra    | 240 minutes       |
+
+Calculate:
+
+\\[ D\_{\text{required}} = D\_{\text{base}} \times \left(1+\frac{\text{extra time percentage}}{100}\right) \\]
+
+Requirements:
+
+- Apply only effective accommodations.
+- Allocate separate rooms when required.
+- Ensure accessible-room requirements are satisfied.
+- Reserve rooms and invigilators for their required durations.
+- Do not cut off extended-time students when the base exam ends.
+
+For multiple student groups in different rooms, each room's allocation should have an end time sufficient for the students assigned to it.
+
+A conservative first implementation can reserve the full maximum required duration for all students sharing a room.
+
+### **Subphase 4.6 — Implement invigilator allocation**
+
+Create:
+
+```
+apps/scheduling/services/invigilator_allocator.py
+```
+
+Rules:
+
+- Invigilator must be available.
+- Invigilator cannot be double-booked.
+- Assigned duration must fit availability.
+- Daily working-hour limits must be respected.
+- Consecutive-hour limits must be respected.
+- Every room must have the required staffing level.
+
+Use a documented, configurable staffing policy, such as a minimum of one invigilator per room and one additional invigilator for every 50 students.
+
+### **Subphase 4.7 — Add traceable decision-making**
+
+Create:
+
+```
+apps/scheduling/services/explanations.py
+```
+
+Every scheduling decision should record:
+
+- Exam selected.
+- Candidate times considered.
+- Rooms considered.
+- Reasons for room rejection.
+- Invigilators considered.
+- Selected resources.
+- Final outcome.
+- Algorithm version.
+- Relevant constraint evidence.
+
+For example:
+
+```
+EXAM-2026-000042
+
+STATUS: UNASSIGNED
+
+PRIMARY REASON:
+NO_ROOM_CAPACITY
+
+EXPLANATION:
+120 active students require allocation.
+
+Largest eligible room:
+80 seats.
+
+No feasible combination of rooms was found
+under the selected equipment and availability rules.
+```
+
+### **Subphase 4.8 — Preserve scheduling history**
+
+Create a `SchedulerRun` for every execution.
+
+For example:
+
+```
+RUN-000001
+    EXAM-001 -> ROOM-001 -> 09:00
+
+RUN-000002
+    EXAM-001 -> ROOM-003 -> 09:00
+```
+
+Never delete or overwrite the first run.
+
+Use `ScheduleEvent` to record assignment creation, rescheduling, cancellation and unassignment.
+
+Use `transaction.atomic()` so a partially allocated examination cannot leave inconsistent room or invigilator records behind.
+
+### **Suggested reason codes**
+
+| Reason code                   | Explanation                                              |
+| ----------------------------- | -------------------------------------------------------- |
+| `NO_CONFLICT_FREE_SLOT`       | Every candidate time conflicts with student examinations |
+| `NO_ROOM_CAPACITY`            | No eligible room combination can fit                     |
+| `NO_EQUIPMENT_ROOM`           | Required equipment is unavailable                        |
+| `ROOM_UNAVAILABLE`            | Room is closed or unavailable                            |
+| `NO_INVIGILATOR`              | No suitable invigilator is available                     |
+| `ACCOMMODATION_UNSATISFIABLE` | Accommodation requirements cannot be met                 |
+| `NO_FEASIBLE_ASSIGNMENT`      | No complete assignment satisfies all constraints         |
+
+The scheduler should track rejected candidate reasons, not just return one unexplained generic failure.
+
+**Expected deliverables:**
+
+- Conflict graph generator.
+- DSatur-based time allocation.
+- Room allocator.
+- Invigilator allocator.
+- Accommodation processor.
+- Immutable assignment history.
+- Explainable decisions and unassigned reasons.
+
+**Completion criteria:** A small test dataset can be scheduled with zero hard-constraint violations, and every unscheduled exam has a documented reason.
+
+## **Phase 5 — Independent Validation, Edge Cases and Evaluation Metrics**
+
+Mandatory evaluation phase
+
+**Goal:** Prove that the generated schedule is correct and that the system can independently detect deliberate violations.
+
+This phase must be independent of the scheduling algorithm.
+
+### **Subphase 5.1 — Build the independent schedule validator**
+
+Create:
+
+```
+apps/validation/services/schedule_validator.py
+```
+
+The validator must examine the persisted database records.
+
+It should independently check:
+
+- Student overlapping examinations.
+- Room capacity violations.
+- Missing equipment.
+- Invigilator overlapping assignments.
+- Accommodation violations.
+- Room closures and availability.
+- Invalid examination durations.
+- Student-room allocation reconciliation.
+
+Do not simply call the scheduler's in-memory feasibility methods again. Use separate checks over persisted data so both systems cannot silently share the same implementation defect.
+
+Persist the results through `ValidationRun` and `DetectedViolation`.
+
+### **Subphase 5.2 — Generate the five mandatory anomaly scenarios**
+
+Maintain two distinct datasets or test scenarios.
+
+**Scenario A — Valid baseline**
+
+Expected result: zero hard violations
+
+Generate valid data → Run scheduler → Run independent validator.
+
+**Scenario B — Deliberate anomalies**
+
+Expected result: five anomaly types detected
+
+Create deliberately invalid assignments → Run detector → Compare results with ground truth.
+
+The five required cases:
+
+| Scenario                       | Deliberate violation                                                            | Expected detection           |
+| ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------- |
+| Student overlapping exams      | Same student assigned to two overlapping exams                                  | `STUDENT_DOUBLE_BOOKING`     |
+| Room capacity exceeded         | 120 students assigned to a 50-seat room                                         | `ROOM_CAPACITY_EXCEEDED`     |
+| Invigilator double-booked      | Same invigilator assigned to two overlapping exams                              | `INVIGILATOR_DOUBLE_BOOKED`  |
+| Accommodation ignored          | Extended-time student receives insufficient examination time or unsuitable room | `ACCOMMODATION_VIOLATION`    |
+| Exam outside room availability | Exam assigned during room closure                                               | `ROOM_UNAVAILABLE_VIOLATION` |
+
+Each test fixture must contain a real database condition that violates the rule.
+
+### **Subphase 5.3 — Create separate ground-truth files**
+
+Create:
+
+```
+data/
+    ground_truth.csv
+    ground_truth.json
+```
+
+Example:
+
+```
+anomaly_id,issue_type,affected_entity_id,expected_violation_code
+EDGE-001,STUDENT_OVERLAP,STU-000123,STUDENT_DOUBLE_BOOKING
+EDGE-002,CAPACITY_EXCEEDED,ROOM-000012,ROOM_CAPACITY_EXCEEDED
+EDGE-003,INVIGILATOR_CLASH,INV-000045,INVIGILATOR_DOUBLE_BOOKED
+EDGE-004,ACCOMMODATION_BREACH,STU-000305,ACCOMMODATION_VIOLATION
+EDGE-005,ROOM_CLOSED,ROOM-000088,ROOM_UNAVAILABLE_VIOLATION
+```
+
+The ground-truth file must not be part of the detector's input.
+
+It is only used by the evaluation service after detection has completed.
+
+### **Subphase 5.4 — Implement anomaly detection and evaluation**
+
+Create:
+
+```
+apps/validation/services/
+    anomaly_detector.py
+    evaluator.py
+```
+
+Implement:
+
+- Detection of actual database violations.
+- Comparison of detected cases with expected labels.
+- True positive calculation.
+- False positive calculation.
+- False negative calculation.
+- Precision, recall and F1-score.
+
+\\[ Precision=\frac{TP}{TP+FP} \\]
+
+\\[ Recall=\frac{TP}{TP+FN} \\]
+
+\\[ F1=2\times\frac{Precision\times Recall}{Precision+Recall} \\]
+
+Calculate these metrics from actual results. Never hardcode a 100% score.
+
+### **Subphase 5.5 — Add constraint scorecard**
+
+Show each rule and its validation status.
+
+| Constraint               | Checks performed | Failures      | Status    |
+| ------------------------ | ---------------- | ------------- | --------- |
+| Student conflicts        | Actual result    | Actual result | Pass/Fail |
+| Room capacity            | Actual result    | Actual result | Pass/Fail |
+| Equipment                | Actual result    | Actual result | Pass/Fail |
+| Invigilator availability | Actual result    | Actual result | Pass/Fail |
+| Accommodation            | Actual result    | Actual result | Pass/Fail |
+| Room availability        | Actual result    | Actual result | Pass/Fail |
+
+The scorecard must reflect the selected validation run.
+
+### **Subphase 5.6 — Calculate business metrics**
+
+Include:
+
+| Metric                       | Description                                                            |
+| ---------------------------- | ---------------------------------------------------------------------- |
+| Scheduling coverage          | Percentage of exams completely scheduled                               |
+| Hard constraint violations   | Total violations in the normal baseline                                |
+| Student allocation rate      | Percentage of eligible student-exam enrollments successfully allocated |
+| Room seat utilization        | Allocated student seats / capacity of rooms used                       |
+| Room time utilization        | Booked room-minutes / available room-minutes                           |
+| Invigilator utilization      | Assigned invigilator-hours / available hours                           |
+| Exception documentation rate | Unassigned exams with documented reasons                               |
+| Detection precision          | Correct reported violations / all reported violations                  |
+| Detection recall             | Detected actual violations / all actual violations                     |
+| Detection F1                 | Combined precision and recall                                          |
+| Scheduler execution time     | Actual time taken by the scheduling run                                |
+
+Also enforce these reconciliation checks:
+
+```
+Total exams
+    =
+Completely scheduled exams
+    +
+Unassigned exams
+```
+
+For every completely scheduled exam:
+
+```
+Active enrolled students
+    =
+Allocated students
+```
+
+Any mismatch should produce an explicit validation error.
+
+**Expected deliverables:**
+
+- Independent schedule validator.
+- Five anomaly test scenarios.
+- Separate ground-truth exports.
+- Detection and evaluation commands.
+- Constraint scorecard.
+- Business metrics and reconciliation report.
+
+**Completion criteria:** The normal baseline has zero hard violations, and the deliberately invalid fixtures are detected and correctly evaluated.
+
+## **Phase 6 — Frontend Development and Workflow Integration**
+
+**Goal:** Build a professional, understandable interface that exposes the complete scheduling workflow and makes the application's decisions visible.
+
+Use Django Templates, Bootstrap 5 and JavaScript. Do not waste development time introducing a separate frontend framework.
+
+### **Subphase 6.1 — Create the common layout**
+
+Create:
+
+```
+dashboard/templates/dashboard/
+    base.html
+    navbar.html
+    sidebar.html
+    footer.html
+```
+
+Include:
+
+- Navigation.
+- User profile.
+- Dashboard layout.
+- Responsive sidebar.
+- Alerts and status messages.
+- Consistent tables and forms.
+
+### **Subphase 6.2 — Build the executive dashboard**
+
+Route:
+
+```
+/
+```
+
+Display:
+
+- Total students.
+- Total courses.
+- Total examinations.
+- Total rooms.
+- Total invigilators.
+- Scheduled examinations.
+- Unassigned examinations.
+- Room utilization.
+- Invigilator utilization.
+- Hard-constraint violations.
+- Latest scheduler run.
+
+Include charts for scheduling outcomes and exception categories.
+
+### **Subphase 6.3 — Build the timetable explorer**
+
+Route:
+
+```
+/schedule/
+```
+
+Display a timetable organized by examination date and time slot.
+
+Include filters for:
+
+- Date.
+- Course.
+- Exam.
+- Room.
+- Invigilator.
+- Department.
+
+Show room allocations, examination duration and accommodation indicators.
+
+### **Subphase 6.4 — Build exam details and assignment explanations**
+
+Route:
+
+```
+/exams/<exam_id>/
+```
+
+Show:
+
+- Exam ID and course.
+- Active enrolled student count.
+- Base examination duration.
+- Accommodated duration.
+- Assigned rooms.
+- Allocated students per room.
+- Invigilators.
+- Equipment requirements.
+- Assignment history.
+- Candidate rejection explanations.
+
+Add a **Why this assignment?** section for explaining how the scheduler selected its resources.
+
+### **Subphase 6.5 — Build the exceptions centre**
+
+Route:
+
+```
+/exceptions/
+```
+
+Include:
+
+- Unassigned examinations.
+- Reason codes.
+- Number of enrolled students.
+- Failed constraints.
+- Supporting evidence.
+- Suggested remediation.
+- Previous scheduling attempts.
+
+### **Subphase 6.6 — Build validation and conflict graph pages**
+
+Routes:
+
+```
+/validation/
+/conflict-graph/
+```
+
+The validation page should show:
+
+- Constraint scorecard.
+- Detected violations.
+- Precision, recall and F1.
+- Validation run history.
+- Data-quality reports.
+
+The conflict graph should visualize exam nodes, shared-student edges and time-slot colouring.
+
+Treat the conflict graph as an enhancement after the essential pages are working.
+
+### **Subphase 6.7 — Add role-based access and actions**
+
+Implement Django authentication and Groups/Permissions.
+
+| Role                   | Access                                            |
+| ---------------------- | ------------------------------------------------- |
+| Learner                | Own timetable and examination information         |
+| Instructor             | Relevant course and examination information       |
+| Academic administrator | Data generation, scheduling, exception resolution |
+| Support staff          | Accommodation and accessibility records           |
+| Platform administrator | Full platform management                          |
+
+Use Django forms for filters and data imports.
+
+Use POST requests with CSRF protection for actions such as:
+
+- Generate dataset.
+- Run scheduler.
+- Validate data.
+- Detect violations.
+- Export results.
+
+These actions must call application services, never execute arbitrary shell commands from a web request.
+
+For a hackathon implementation, synchronous service execution is acceptable if the full workload completes within the web request's practical limits. Do not introduce Celery just for appearance.
+
+**Expected deliverables:**
+
+- Responsive dashboard.
+- Examination timetable.
+- Exam detail view.
+- Student lookup.
+- Exceptions centre.
+- Validation scorecard.
+- Conflict graph.
+- Role-aware navigation and permissions.
+
+**Completion criteria:** A judge can open the application, understand the scheduling results and inspect why a particular decision was made.
+
+## **Phase 7 — Testing, Documentation, Reproducibility and Final Demonstration**
+
+**Goal:** Verify the complete system, prepare the repository and make the project easy for judges to run and evaluate.
+
+### **Subphase 7.1 — Complete the testing suite**
+
+Organize tests into these categories:
+
+| Test category         | What to verify                                   |
+| --------------------- | ------------------------------------------------ |
+| Model tests           | Database relationships, constraints and IDs      |
+| Generator tests       | Fixed seed, data volumes and relationships       |
+| Conflict graph tests  | Correct shared-student edges                     |
+| Scheduler tests       | Correct time and room allocation                 |
+| Accommodation tests   | Extra time, accessibility and separate rooms     |
+| Validator tests       | Detection of actual persisted violations         |
+| Integration tests     | Complete generate-to-schedule-to-report workflow |
+| Reproducibility tests | Identical canonical exports                      |
+| UI tests              | Pages, forms, permissions and error handling     |
+
+### **Subphase 7.2 — Add boundary and failure tests**
+
+Do not limit testing to the five mandatory edge cases.
+
+Include:
+
+| Scenario                                         | Expected result                                                |
+| ------------------------------------------------ | -------------------------------------------------------------- |
+| Students equal room capacity                     | Accepted                                                       |
+| Students exceed room capacity by one             | Rejected                                                       |
+| Two exams meet at exactly the same boundary time | Accepted if intervals do not overlap and no buffer is required |
+| Room closes during an exam                       | Rejected                                                       |
+| Invigilator availability exactly covers an exam  | Accepted                                                       |
+| Invigilator leaves before the exam finishes      | Rejected                                                       |
+| No suitable room exists                          | Unassigned with reason                                         |
+| No suitable invigilator exists                   | Unassigned with reason                                         |
+| Accommodation is expired                         | Not applied                                                    |
+| Accommodation is active                          | Applied                                                        |
+| Unknown student ID                               | Friendly error response                                        |
+| Repeated scheduler execution                     | Earlier history retained                                       |
+| Failed assignment transaction                    | No partial allocations left behind                             |
+
+Use half-open time intervals `[start, end)` consistently so that two consecutive examinations do not automatically count as overlapping.
+
+Also test that the same student is never allocated to two rooms within the same examination.
+
+### **Subphase 7.3 — Verify reproducibility and scale**
+
+Run the full dataset twice using the same fixed seed.
+
+Compare:
+
+- Row counts.
+- Primary keys.
+- Foreign key references.
+- Exported files.
+- SHA-256 checksums.
+
+Use an identical generation configuration for both runs.
+
+Measure:
+
+- Generation time.
+- Scheduling time.
+- Validation time.
+- Memory usage where practical.
+
+Optimize database queries with indexes, `select_related()`, `prefetch_related()` and batch inserts.
+
+SQLite is suitable for this hackathon dataset, but document its write-concurrency limitations and the path to PostgreSQL for a production deployment.
+
+### **Subphase 7.4 — Complete documentation**
+
+Final repository documentation:
+
+```
+README.md
+SOURCE_MANIFEST.md
+requirements.txt
+
+docs/
+    architecture.md
+    data_dictionary.md
+    er_diagram.md
+    business_rules.md
+    test_report.md
+    run_book.md
+    limitations.md
+    reproducibility_report.txt
+```
+
+The README must include:
+
+1. Problem statement and solution.
+2. Three-tier architecture.
+3. ER diagram.
+4. Database schema.
+5. Scheduling algorithm.
+6. Hard and soft constraints.
+7. Edge-case handling.
+8. Testing results.
+9. Actual generated metrics.
+10. Reproducibility evidence.
+11. Installation and execution commands.
+12. Known limitations.
+
+`SOURCE_MANIFEST.md` should clearly explain that the generated records are synthetic and document any external reference material if used.
+
+### **Subphase 7.5 — Prepare the final demonstration**
+
+I recommend this 4–5 minute demonstration:
+
+| Time      | Demonstration                                           |
+| --------- | ------------------------------------------------------- |
+| 0:00–0:30 | Introduce the problem and three-tier architecture       |
+| 0:30–1:00 | Show generated dataset and validation                   |
+| 1:00–2:00 | Run scheduler and display timetable                     |
+| 2:00–2:40 | Explain why an exam received its assigned room and time |
+| 2:40–3:40 | Demonstrate the five anomaly detections                 |
+| 3:40–4:15 | Show constraint scorecard and evaluation metrics        |
+| 4:15–4:45 | Show reproducibility and project documentation          |
+
+**Expected deliverables:**
+
+- Complete automated test suite.
+- Passing baseline validation.
+- Anomaly evaluation report.
+- Reproducibility proof.
+- Full dataset execution report.
+- Complete documentation.
+- Final working demonstration.
+
+**Completion criteria:** A judge can clone the project, follow the README, generate the dataset, run the scheduler and independently verify the reported results.
+
+# **3. Recommended Scalable Project Structure**
+
+This is the project structure I recommend implementing. It maintains clear separation of concerns while keeping the initial Django setup manageable.
+
+```
+exam_scheduler/
+│
+├── manage.py
+├── requirements.txt
+├── README.md
+├── SOURCE_MANIFEST.md
+│
+├── config/
+│   ├── __init__.py
+│   ├── settings.py
+│   ├── urls.py
+│   ├── asgi.py
+│   └── wsgi.py
+│
+├── apps/
+│   │
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── student.py
+│   │   │   ├── course.py
+│   │   │   ├── enrollment.py
+│   │   │   ├── exam.py
+│   │   │   ├── room.py
+│   │   │   ├── invigilator.py
+│   │   │   └── accommodation.py
+│   │   ├── services/
+│   │   │   ├── id_generator.py
+│   │   │   └── data_generator.py
+│   │   ├── management/
+│   │   │   └── commands/
+│   │   │       ├── generate_data.py
+│   │   │       └── export_data.py
+│   │   └── admin.py
+│   │
+│   ├── scheduling/
+│   │   ├── __init__.py
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── assignment.py
+│   │   │   ├── scheduler_run.py
+│   │   │   ├── availability.py
+│   │   │   ├── room_closure.py
+│   │   │   ├── time_slot.py
+│   │   │   ├── student_room_allocation.py
+│   │   │   ├── invigilator_assignment.py
+│   │   │   ├── unassigned_exam.py
+│   │   │   └── schedule_event.py
+│   │   │
+│   │   ├── services/
+│   │   │   ├── conflict_graph.py
+│   │   │   ├── scheduler.py
+│   │   │   ├── slot_allocator.py
+│   │   │   ├── room_allocator.py
+│   │   │   ├── invigilator_allocator.py
+│   │   │   ├── accommodation.py
+│   │   │   ├── constraints.py
+│   │   │   └── explanations.py
+│   │   │
+│   │   ├── management/
+│   │   │   └── commands/
+│   │   │       └── run_scheduler.py
+│   │   │
+│   │   └── admin.py
+│   │
+│   ├── validation/
+│   │   ├── __init__.py
+│   │   ├── models.py
+│   │   ├── services/
+│   │   │   ├── data_validator.py
+│   │   │   ├── schedule_validator.py
+│   │   │   ├── anomaly_detector.py
+│   │   │   ├── evaluator.py
+│   │   │   └── metrics.py
+│   │   │
+│   │   └── management/
+│   │       └── commands/
+│   │           ├── validate_data.py
+│   │           ├── validate_schedule.py
+│   │           ├── detect_violations.py
+│   │           ├── evaluate_anomalies.py
+│   │           └── verify_reproducibility.py
+│   │
+│   ├── dashboard/
+│   │   ├── views.py
+│   │   ├── forms.py
+│   │   ├── urls.py
+│   │   ├── templates/
+│   │   │   └── dashboard/
+│   │   │       ├── base.html
+│   │   │       ├── dashboard.html
+│   │   │       ├── timetable.html
+│   │   │       ├── exam_detail.html
+│   │   │       ├── student_lookup.html
+│   │   │       ├── exceptions.html
+│   │   │       ├── validation.html
+│   │   │       └── conflict_graph.html
+│   │   │
+│   │   └── static/
+│   │       └── dashboard/
+│   │           ├── css/
+│   │           ├── js/
+│   │           └── images/
+│   │
+│   └── accounts/
+│       ├── models.py
+│       ├── views.py
+│       ├── forms.py
+│       └── permissions.py
+│
+├── generator/
+│   ├── config.py
+│   ├── master_data.py
+│   ├── enrollments.py
+│   └── anomalies.py
+│
+├── data/
+│   ├── exports/
+│   │   ├── csv/
+│   │   ├── json/
+│   │   └── sql/
+│   ├── ground_truth.csv
+│   └── validation_summary.json
+│
+├── docs/
+│   ├── architecture.md
+│   ├── data_dictionary.md
+│   ├── er_diagram.md
+│   ├── business_rules.md
+│   ├── test_report.md
+│   ├── run_book.md
+│   └── limitations.md
+│
+└── tests/
+    ├── test_models.py
+    ├── test_generator.py
+    ├── test_conflict_graph.py
+    ├── test_scheduler.py
+    ├── test_constraints.py
+    ├── test_accommodations.py
+    ├── test_anomalies.py
+    ├── test_reproducibility.py
+    ├── test_integration.py
+    └── test_views.py
+```
+
+**Project structure notes:**
+
+- Split large Django model files into packages only when the model count grows. Import models through each package's `__init__.py` so Django detects them.
+- Keep scheduling and validation services independent of templates and HTTP requests.
+- Store generated data outside source-code modules.
+- Keep full generated exports out of Git; include small sample files instead.
+- Add an app only when it represents a meaningful functional responsibility.
+- Use the Django Admin for internal data management rather than building unnecessary CRUD screens.
+
+# **4. Final Management Command Workflow**
+
+Your project should support a straightforward execution flow.
+
+```
+# 1. Create the database
+python manage.py migrate
+
+# 2. Generate synthetic records
+python manage.py generate_data --seed 20261022 --scale full
+
+# 3. Validate source data
+python manage.py validate_data
+
+# 4. Run examination scheduling
+python manage.py run_scheduler
+
+# 5. Independently validate the schedule
+python manage.py validate_schedule
+
+# 6. Create deliberate anomaly test fixtures
+python manage.py inject_anomalies
+
+# 7. Detect violations
+python manage.py detect_violations
+
+# 8. Evaluate anomaly detection
+python manage.py evaluate_anomalies
+
+# 9. Export data and reports
+python manage.py export_data
+
+# 10. Verify reproducibility
+python manage.py verify_reproducibility --seed 20261022
+
+# 11. Run all automated tests
+python manage.py test
+```
+
+The anomaly commands should operate on an isolated test scenario or dedicated fixture run. They must not contaminate the clean baseline used to demonstrate zero violations.
+
+# **5. Final Implementation Priority**
+
+Not every feature has equal importance. Follow this priority if development time becomes limited.
+
+| Priority | Component                                      | Importance  |
+| -------- | ---------------------------------------------- | ----------- |
+| P0       | Correct database relationships and constraints | Essential   |
+| P0       | Deterministic data generator                   | Essential   |
+| P0       | Conflict graph and scheduling engine           | Essential   |
+| P0       | Room, invigilator and accommodation allocation | Essential   |
+| P0       | Independent validator                          | Essential   |
+| P0       | Five anomaly scenarios and ground truth        | Essential   |
+| P1       | Reproducibility and automated testing          | Very high   |
+| P1       | Dashboard and timetable                        | Very high   |
+| P1       | Assignment explanations and exception centre   | Very high   |
+| P2       | Role-based interface                           | High        |
+| P2       | Conflict graph visualization                   | Enhancement |
+| P2       | Advanced charts and UI animations              | Enhancement |
+
+Do not sacrifice a correct scheduler or validator to build decorative UI features.
+
