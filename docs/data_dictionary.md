@@ -149,7 +149,7 @@ Unique together: (run, exam, room). All rooms of one exam in a run share the sam
 | Equipment | code | name | e.g. `PROJECTOR, COMPUTER, LAB_BENCH, ACCESSIBLE_DESK` |
 | RoomEquipment | auto | room FK, equipment FK | unique (room, equipment) |
 | ExamRequirementEquipment | auto | requirement FK, equipment FK | unique pair |
-| RoomClosure | `CLS-` | room FK, start_at, end_at, reason (`MAINTENANCE, EVENT, REPAIR`) | end_at > start_at |
+| RoomClosure | `CLS-` | room FK, optional scheduler-run FK, start_at, end_at, reason (`MAINTENANCE, EVENT, REPAIR`) | end_at > start_at; null run means a global closure |
 | TimeSlot | `SLOT-` | slot_date, start_time, label | unique (slot_date, start_time) |
 | SchedulerRun | `RUN-` | run_type (`BASELINE, ANOMALY_FIXTURE`), status, algorithm_version, seed, started_at, finished_at, notes | never deleted |
 | ScheduleEvent | `EVT-` | run FK, assignment FK (null), exam FK, event_type (`ASSIGNED, MOVED, CANCELLED, UNASSIGNED, SUPERSEDED`), detail JSON, event_at | append-only; no update/delete |
@@ -161,7 +161,7 @@ Unique together: (run, exam, room). All rooms of one exam in a run share the sam
 
 ## Ground-truth file (NOT a database input)
 
-`data/ground_truth.csv` columns: `anomaly_id, issue_type, assignment_id, affected_entity_id, expected_violation_code`.
+`data/ground_truth.csv` columns: `anomaly_id, issue_type, assignment_id, affected_entity_id, expected_violation_code, run_id`.
 It is read only by the evaluator after detection finishes.
 
 ## Phase 3 generation assumptions
@@ -173,6 +173,10 @@ It is read only by the evaluator after detection finishes.
   ten courses without an exam; only courses with an exam receive enrollments.
 - Each student is enrolled in 4-6 exam courses. Enrollment counts are derived
   from the bridge rows rather than stored separately.
+- Lecture halls are accessible and provisioned for computer/projector/practical
+  examinations so both starter and full scales can schedule specialist exams
+  without relying on unusually rare room-type draws. Invigilators have broad
+  operating-day windows on a deterministic subset of exam days.
 - Generated identities are deterministic counters. Timestamps use the fixed
   UTC exam calendar; no external or personal data is used.
 - Assignment-linked anomaly labels are produced with the isolated anomaly

@@ -1,0 +1,58 @@
+[
+  {
+    "anomaly_id": "EDGE-001",
+    "issue_type": "STUDENT_OVERLAP",
+    "assignment_id": "ASN-EXAM-2026-000001-ROOM-000011-RUN-000002",
+    "affected_entity_id": "STU-000001",
+    "expected_violation_code": "STUDENT_DOUBLE_BOOKING",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-001",
+    "issue_type": "STUDENT_OVERLAP",
+    "assignment_id": "ASN-EXAM-2026-000020-ROOM-000001-RUN-000002",
+    "affected_entity_id": "STU-000001",
+    "expected_violation_code": "STUDENT_DOUBLE_BOOKING",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-002",
+    "issue_type": "CAPACITY_EXCEEDED",
+    "assignment_id": "ASN-EXAM-2026-000004-ROOM-000003-RUN-000002",
+    "affected_entity_id": "ROOM-000003",
+    "expected_violation_code": "ROOM_CAPACITY_EXCEEDED",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-003",
+    "issue_type": "INVIGILATOR_CLASH",
+    "assignment_id": "ASN-EXAM-2026-000006-ROOM-000011-RUN-000002",
+    "affected_entity_id": "INV-000023",
+    "expected_violation_code": "INVIGILATOR_DOUBLE_BOOKED",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-003",
+    "issue_type": "INVIGILATOR_CLASH",
+    "assignment_id": "ASN-EXAM-2026-000010-ROOM-000001-RUN-000002",
+    "affected_entity_id": "INV-000023",
+    "expected_violation_code": "INVIGILATOR_DOUBLE_BOOKED",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-004",
+    "issue_type": "ACCOMMODATION_BREACH",
+    "assignment_id": "ASN-EXAM-2026-000003-ROOM-000001-RUN-000002",
+    "affected_entity_id": "STU-000017",
+    "expected_violation_code": "ACCOMMODATION_VIOLATION",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-005",
+    "issue_type": "ROOM_CLOSED",
+    "assignment_id": "ASN-EXAM-2026-000007-ROOM-000011-RUN-000002",
+    "affected_entity_id": "ROOM-000011",
+    "expected_violation_code": "ROOM_UNAVAILABLE_VIOLATION",
+    "run_id": "RUN-000002"
+  }
+]

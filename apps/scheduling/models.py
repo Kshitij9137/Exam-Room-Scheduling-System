@@ -32,6 +32,13 @@ class RoomClosure(models.Model):
 
     closure_id = models.CharField(primary_key=True, max_length=10, validators=[id_validator("closure")])
     room = models.ForeignKey(Room, on_delete=models.PROTECT, related_name="closures")
+    run = models.ForeignKey(
+        "SchedulerRun",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="room_closures",
+    )
     start_at = models.DateTimeField()
     end_at = models.DateTimeField()
     reason = models.CharField(max_length=12, choices=Reason.choices)

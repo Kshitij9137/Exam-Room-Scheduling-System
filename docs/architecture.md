@@ -50,7 +50,7 @@
 |---|---|
 | `apps/core` | Master data models, ID generator, data generator service, export command |
 | `apps/scheduling` | Scheduling models, conflict graph, slot/room/invigilator allocators, accommodation logic, explanations, `run_scheduler` |
-| `apps/validation` | `ValidationRun`, `DetectedViolation`, data validator, schedule validator, anomaly detector, evaluator, metrics |
+| `apps/validation` | `ValidationRun`, `DetectedViolation`, independent schedule checks, anomaly fixtures, evaluator, and business metrics |
 | `apps/dashboard` | Views, forms, templates, static files |
 | `apps/accounts` | Groups and permissions for the five actors |
 | `generator/` | Pure-Python seeded generation logic (config, master data, enrollments, anomalies) |

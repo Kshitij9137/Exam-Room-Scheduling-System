@@ -133,6 +133,9 @@ def generate_rooms_and_capacities(rng, count):
                 effective_to=None,
             )
         )
+    for room in rooms:
+        if room["room_type"] == "LECTURE_HALL":
+            room["is_accessible"] = True
     return rooms, capacities
 
 
@@ -141,7 +144,7 @@ def generate_room_equipment_pairs(rooms):
     for room in rooms:
         equipment = {"WHITEBOARD"}
         if room["room_type"] == "LECTURE_HALL":
-            equipment.add("PROJECTOR")
+            equipment.update({"COMPUTER", "LAB_BENCH", "PROJECTOR"})
         elif room["room_type"] == "COMPUTER_LAB":
             equipment.update({"COMPUTER", "PROJECTOR"})
         elif room["room_type"] == "SCIENCE_LAB":
@@ -212,18 +215,16 @@ def generate_invigilator_availability(rng, invigilators, start_index=1):
     for invigilator in invigilators:
         window_count = rng.randint(4, 7)
         for day in rng.sample(EXAM_DATES, min(window_count, len(EXAM_DATES))):
-            start_hour = rng.choice([8, 10, 13, 15])
-            end_hour = start_hour + rng.choice([3, 4, 5])
             availability.append(
                 dict(
                     availability_id=make_id("availability", index),
                     room_id=None,
                     invigilator_id=invigilator["invigilator_id"],
                     start_at=dt.datetime.fromisoformat(day).replace(
-                        hour=start_hour, tzinfo=dt.timezone.utc
+                        hour=8, tzinfo=dt.timezone.utc
                     ),
                     end_at=dt.datetime.fromisoformat(day).replace(
-                        hour=end_hour, tzinfo=dt.timezone.utc
+                        hour=20, tzinfo=dt.timezone.utc
                     ),
                 )
             )

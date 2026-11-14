@@ -1,0 +1,85 @@
+{
+  "validation_id": "VAL-000001",
+  "scheduler_run": "RUN-000001",
+  "status": "PASSED",
+  "checks_performed": 1502,
+  "failures": 0,
+  "checks": [
+    {
+      "check": "student_double_booking",
+      "checks_performed": 632,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "room_capacity",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "missing_equipment",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "room_double_booked",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "invigilator_double_booked",
+      "checks_performed": 32,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "invigilator_unavailable",
+      "checks_performed": 32,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "accommodation_violation",
+      "checks_performed": 632,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "room_unavailable",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "student_allocation_mismatch",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "invalid_duration",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    }
+  ],
+  "business_metrics": {
+    "scheduler_run": "RUN-000001",
+    "term": "2026-FALL",
+    "total_exams": 20,
+    "term_exam_count": 20,
+    "scheduled_exams": 15,
+    "unassigned_exams": 5,
+    "scheduling_coverage": 0.75,
+    "student_allocation_rate": 1.0,
+    "room_seat_utilization": 0.1132,
+    "room_time_utilization": 0.0829,
+    "invigilator_utilization": 0.0944,
+    "exception_documentation_rate": 1.0,
+    "reconciliation_ok": true,
+    "reconciliation_errors": []
+  }
+}

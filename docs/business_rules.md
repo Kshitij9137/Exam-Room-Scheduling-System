@@ -91,7 +91,9 @@ These are university policies chosen by us, not given by the problem statement.
 | Exams per course | 1 per term |
 | Invigilator ratio | 1 per 50 students, minimum 1 per room |
 | Invigilator daily limit | 8 hours (`max_daily_hours`) |
+| Invigilator consecutive limit | 4 continuous hours; any positive gap resets the consecutive-work period |
 | Room turnover buffer | 0 minutes |
+| Anomaly-fixture room closures | Scoped to their `SchedulerRun`; null run means a global closure |
 | Accommodated student rule | Allocated to rooms whose interval covers their extended time. First implementation reserves the maximum required duration for everyone sharing that room. |
 | Separate-room accommodation | Student is placed in a room with only accommodated students |
 | Accommodation share | About 8-10 percent of students |
