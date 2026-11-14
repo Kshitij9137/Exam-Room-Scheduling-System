@@ -138,10 +138,12 @@ class AnomalyPipelineTests(TestCase):
     def test_inject_rejects_non_baseline_run(self):
         generate_and_persist(seed=SEED_DEFAULT, scale="starter")
         baseline = run_scheduler(seed=SEED_DEFAULT)
-        anomaly, _labels, _selected = inject(baseline.run_id)
+        with tempfile.TemporaryDirectory(prefix="phase5_outputs_") as folder:
+            with override_settings(BASE_DIR=Path(folder)):
+                anomaly, _labels, _selected = inject(baseline.run_id)
 
-        with self.assertRaisesRegex(ValueError, "not a BASELINE"):
-            inject(anomaly.run_id)
+                with self.assertRaisesRegex(ValueError, "not a BASELINE"):
+                    inject(anomaly.run_id)
 
     def test_evaluator_requires_run_scoped_ground_truth(self):
         generate_and_persist(seed=SEED_DEFAULT, scale="starter")

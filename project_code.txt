@@ -2995,7 +2995,7 @@ FILE: README.md
 ======================================================================
 # Exam & Room Scheduling System
 
-Django + SQLite + Bootstrap. Status: **Phases 3–5 implemented**.
+Django + SQLite + Bootstrap 5. Status: **Phases 3–6 implemented**.
 
 ## Setup
 ```bash
@@ -3003,6 +3003,7 @@ python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 python manage.py migrate
+python manage.py setup_roles
 python manage.py createsuperuser
 python manage.py generate_data --seed 20261022 --scale starter
 python manage.py validate_data
@@ -3013,8 +3014,10 @@ python manage.py inject_anomalies
 python manage.py detect_violations
 python manage.py evaluate_anomalies
 python manage.py export_data
-python manage.py runserver      # http://127.0.0.1:8000  and /admin/
-python manage.py test           # all tests
+python manage.py runserver
+# Open http://127.0.0.1:8000/ and sign in at /accounts/login/
+python manage.py test tests.test_views
+python manage.py test            # all tests
 ```
 See `docs/` for architecture, business rules, ER diagram and data dictionary.
 
@@ -3029,6 +3032,24 @@ fixture run, write run-scoped ground truth to `data/ground_truth.csv` and
 `data/ground_truth.json`, and report evaluation metrics to
 `data/anomaly_evaluation.json`. Room closures attached to an anomaly fixture
 are scoped to that run and do not affect baseline schedules.
+
+## Dashboard (Phase 6)
+
+The read-only dashboard pages are available without signing in:
+
+- `/` — overview and latest run metrics
+- `/schedule/` — searchable timetable
+- `/exams/<exam-id>/` — exam assignments and explanation history
+- `/students/?q=<student-id-or-email>` — student enrollments and personal timetable
+- `/exceptions/` — unassigned exams and reason evidence
+- `/validation/` — scorecard, detected violations, and validation history
+- `/conflict-graph/` — interactive exam conflict graph
+
+Workflow actions are available to Django staff/superusers and members of the
+**Academic Administrator** group. `setup_roles` creates the documented role
+groups; add users to the appropriate group through Django admin. All dashboard
+actions are CSRF-protected POST requests. Use `/admin/` for internal record
+management.
 
 ======================================================================
 FILE: requirements.txt
@@ -4342,6 +4363,407 @@ class DashboardConfig(AppConfig):
     name = "apps.dashboard"
 
 ======================================================================
+FILE: apps\dashboard\forms.py
+======================================================================
+"""Filters used by dashboard pages."""
+
+from django import forms
+
+from apps.core.models import Department, Invigilator, Room
+
+
+class TimetableFilterForm(forms.Form):
+    date = forms.DateField(
+        required=False,
+        widget=forms.DateInput(attrs={"type": "date", "class": "form-control"}),
+    )
+    exam = forms.CharField(
+        required=False,
+        widget=forms.TextInput(
+            attrs={"class": "form-control", "placeholder": "EXAM-2026-000042"}
+        ),
+    )
+    course = forms.CharField(
+        required=False,
+        widget=forms.TextInput(
+            attrs={"class": "form-control", "placeholder": "CS101 or CRS-000042"}
+        ),
+    )
+    room = forms.ModelChoiceField(
+        queryset=Room.objects.filter(status=Room.Status.ACTIVE).order_by("room_id"),
+        required=False,
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    invigilator = forms.ModelChoiceField(
+        queryset=Invigilator.objects.filter(
+            status=Invigilator.Status.ACTIVE
+        ).order_by("invigilator_id"),
+        required=False,
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    department = forms.ChoiceField(
+        choices=[("", "All departments"), *Department.choices],
+        required=False,
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+
+======================================================================
+FILE: apps\dashboard\permissions.py
+======================================================================
+"""Role-based helpers backed by Django Groups."""
+
+from functools import wraps
+
+from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth.decorators import login_required
+from django.shortcuts import redirect
+from django.views.decorators.http import require_POST
+
+
+def user_roles(user) -> set[str]:
+    if not user.is_authenticated:
+        return set()
+    if user.is_superuser or user.is_staff:
+        return {settings.ROLE_PLATFORM_ADMIN}
+    return set(user.groups.values_list("name", flat=True))
+
+
+def can_run_actions(user) -> bool:
+    if not user.is_authenticated:
+        return False
+    if user.is_superuser or user.is_staff:
+        return True
+    return user.groups.filter(name=settings.ROLE_ADMINISTRATOR).exists()
+
+
+def staff_required(view_func):
+    """Require authentication, POST, and an action-capable role."""
+
+    @wraps(view_func)
+    @login_required
+    @require_POST
+    def wrapper(request, *args, **kwargs):
+        if not can_run_actions(request.user):
+            messages.error(
+                request,
+                "This action requires the Academic Administrator role or staff status.",
+            )
+            return redirect("dashboard:home")
+        return view_func(request, *args, **kwargs)
+
+    return wrapper
+
+======================================================================
+FILE: apps\dashboard\services.py
+======================================================================
+"""Read-only aggregation helpers used by dashboard views."""
+
+import json
+import logging
+from collections import defaultdict
+from pathlib import Path
+
+from django.conf import settings
+from django.db.models import Count, Q
+
+from apps.core.models import (
+    Accommodation,
+    Course,
+    Enrollment,
+    Exam,
+    ExamRequirementEquipment,
+    Invigilator,
+    Room,
+    Student,
+)
+from apps.scheduling.models import (
+    ScheduleAssignment,
+    ScheduleEvent,
+    SchedulerRun,
+    StudentRoomAllocation,
+    UnassignedExam,
+)
+from apps.scheduling.services.conflict_graph import build_conflict_graph
+from apps.validation.models import DetectedViolation, ValidationRun
+
+logger = logging.getLogger(__name__)
+
+
+def latest_run() -> SchedulerRun | None:
+    return SchedulerRun.objects.order_by("-run_id").first()
+
+
+def latest_completed_run() -> SchedulerRun | None:
+    return (
+        SchedulerRun.objects.filter(status=SchedulerRun.Status.COMPLETED)
+        .order_by("-run_id")
+        .first()
+    )
+
+
+def latest_validation(run: SchedulerRun | None = None) -> ValidationRun | None:
+    queryset = ValidationRun.objects.order_by("-validation_id")
+    if run is not None:
+        queryset = queryset.filter(scheduler_run=run)
+    return queryset.first()
+
+
+def load_scorecard() -> dict | None:
+    path = Path(settings.BASE_DIR) / "data" / "validation_scorecard.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning("Could not read dashboard scorecard at %s.", path, exc_info=True)
+        return None
+
+
+def _reason_breakdown(run: SchedulerRun) -> dict[str, int]:
+    rows = (
+        UnassignedExam.objects.filter(run=run)
+        .values("primary_reason_code")
+        .annotate(count=Count("unassigned_id"))
+    )
+    return {row["primary_reason_code"]: row["count"] for row in rows}
+
+
+def _violation_breakdown(validation_run: ValidationRun | None) -> dict[str, int]:
+    if validation_run is None:
+        return {}
+    rows = (
+        DetectedViolation.objects.filter(validation_run=validation_run)
+        .values("violation_code")
+        .annotate(count=Count("violation_id"))
+    )
+    return {row["violation_code"]: row["count"] for row in rows}
+
+
+def dashboard_summary() -> dict:
+    counts = {
+        "students": Student.objects.count(),
+        "courses": Course.objects.count(),
+        "exams": Exam.objects.count(),
+        "rooms": Room.objects.count(),
+        "invigilators": Invigilator.objects.count(),
+        "enrollments": Enrollment.objects.count(),
+        "accommodations": Accommodation.objects.count(),
+    }
+    run = latest_run()
+    validation = latest_validation(run) if run else None
+    scorecard = load_scorecard()
+    if scorecard and (
+        validation is None
+        or scorecard.get("validation_id") != validation.validation_id
+    ):
+        scorecard = None
+
+    scheduled_exams = (
+        ScheduleAssignment.objects.filter(
+            run=run, status=ScheduleAssignment.Status.ASSIGNED
+        )
+        .values("exam_id")
+        .distinct()
+        .count()
+        if run
+        else 0
+    )
+    unassigned_exams = (
+        UnassignedExam.objects.filter(run=run).values("exam_id").distinct().count()
+        if run
+        else 0
+    )
+    metrics = scorecard.get("business_metrics", {}) if scorecard else {}
+
+    return {
+        "counts": counts,
+        "latest_run": run,
+        "latest_validation": validation,
+        "scheduled_exams": scheduled_exams,
+        "unassigned_exams": unassigned_exams,
+        "unassigned_reasons": _reason_breakdown(run) if run else {},
+        "violations_breakdown": _violation_breakdown(validation),
+        "scorecard": scorecard,
+        "metrics": metrics,
+        "hard_violations": validation.failures if validation else None,
+    }
+
+
+def timetable_rows(run: SchedulerRun, filters: dict | None = None) -> dict:
+    filters = filters or {}
+    queryset = (
+        ScheduleAssignment.objects.filter(
+            run=run, status=ScheduleAssignment.Status.ASSIGNED
+        )
+        .select_related("exam__course", "room")
+        .prefetch_related(
+            "invigilator_assignments__invigilator", "student_allocations"
+        )
+        .order_by("start_at", "room__room_id")
+    )
+
+    if filters.get("date"):
+        queryset = queryset.filter(start_at__date=filters["date"])
+    if filters.get("exam"):
+        queryset = queryset.filter(exam_id=filters["exam"].strip())
+    if filters.get("course"):
+        code = filters["course"].strip()
+        queryset = queryset.filter(
+            Q(exam__course_id=code) | Q(exam__course__course_code__iexact=code)
+        )
+    if filters.get("room"):
+        queryset = queryset.filter(room=filters["room"])
+    if filters.get("invigilator"):
+        queryset = queryset.filter(
+            invigilator_assignments__invigilator=filters["invigilator"]
+        ).distinct()
+    if filters.get("department"):
+        queryset = queryset.filter(exam__course__department=filters["department"])
+
+    grouped = defaultdict(list)
+    for assignment in queryset:
+        grouped[assignment.start_at.date()].append(assignment)
+    return dict(sorted(grouped.items()))
+
+
+def exam_detail(exam: Exam) -> dict:
+    run = latest_completed_run()
+    context = {
+        "exam": exam,
+        "run": run,
+        "assignments": [],
+        "unassigned": None,
+        "events": [],
+        "required_equipment": list(
+            ExamRequirementEquipment.objects.filter(
+                requirement__exam__exam_id=exam.exam_id
+            )
+            .values_list("equipment_id", flat=True)
+            .order_by("equipment_id")
+        ),
+        "active_enrollments": Enrollment.objects.filter(
+            course=exam.course,
+            term=exam.term,
+            status=Enrollment.Status.ACTIVE,
+        ).count(),
+        "accommodations": [],
+        "assigned_students": [],
+    }
+    if run is None:
+        return context
+
+    assignments = list(
+        ScheduleAssignment.objects.filter(run=run, exam=exam)
+        .select_related("room")
+        .prefetch_related(
+            "invigilator_assignments__invigilator",
+            "student_allocations__student",
+        )
+        .order_by("assignment_id")
+    )
+    context["assignments"] = assignments
+    context["unassigned"] = UnassignedExam.objects.filter(
+        run=run, exam=exam
+    ).first()
+    context["events"] = list(
+        ScheduleEvent.objects.filter(run=run, exam=exam).order_by("event_id")
+    )
+
+    if assignments:
+        exam_date = assignments[0].start_at.date()
+        active_accommodations = Accommodation.objects.filter(
+            status=Accommodation.Status.ACTIVE,
+            effective_from__lte=exam_date,
+        ).filter(Q(effective_to__isnull=True) | Q(effective_to__gte=exam_date))
+        allocated_ids = set(
+            StudentRoomAllocation.objects.filter(assignment__in=assignments)
+            .values_list("student_id", flat=True)
+        )
+        context["accommodations"] = list(
+            active_accommodations.filter(student_id__in=allocated_ids).select_related(
+                "student"
+            )
+        )
+        context["assigned_students"] = list(
+            StudentRoomAllocation.objects.filter(assignment__in=assignments)
+            .select_related("student", "assignment")
+            .order_by("assignment__room_id", "student_id")
+        )
+    return context
+
+
+def exceptions_rows(run: SchedulerRun) -> list[UnassignedExam]:
+    return list(
+        UnassignedExam.objects.filter(run=run)
+        .select_related("exam__course")
+        .order_by("exam_id")
+    )
+
+
+def validation_page_data() -> dict:
+    validation = latest_validation()
+    violations = []
+    if validation:
+        violations = list(
+            DetectedViolation.objects.filter(validation_run=validation)
+            .select_related("assignment__exam__course", "assignment__room")
+            .order_by("violation_id")
+        )
+    scorecard = load_scorecard()
+    if scorecard and (
+        validation is None
+        or scorecard.get("validation_id") != validation.validation_id
+    ):
+        scorecard = None
+    return {
+        "latest_validation": validation,
+        "scorecard": scorecard,
+        "violations": violations,
+        "history": list(ValidationRun.objects.order_by("-validation_id")[:15]),
+    }
+
+
+def conflict_graph_data(top_n: int = 30) -> dict:
+    term = settings.SCHEDULER_POLICY["TERM"]
+    exams = list(Exam.objects.filter(term=term).select_related("course"))
+    if not exams:
+        return {"nodes": [], "edges": [], "term": term}
+
+    graph, students_by_exam = build_conflict_graph(exams, term=term)
+    top = sorted(graph.degree.items(), key=lambda item: (-item[1], item[0]))[:top_n]
+    selected = {exam_id for exam_id, _degree in top}
+    exam_by_id = {exam.exam_id: exam for exam in exams}
+    slot_by_exam = {}
+    run = latest_run()
+    if run:
+        for assignment in ScheduleAssignment.objects.filter(
+            run=run, exam_id__in=selected
+        ).order_by("start_at", "assignment_id"):
+            slot_by_exam.setdefault(assignment.exam_id, assignment.start_at.isoformat())
+
+    nodes = []
+    for exam_id, degree in top:
+        exam = exam_by_id[exam_id]
+        nodes.append(
+            {
+                "id": exam_id,
+                "label": exam_id,
+                "course": exam.course.course_code,
+                "degree": degree,
+                "enrollment": len(students_by_exam.get(exam_id, ())),
+                "slot": slot_by_exam.get(exam_id, ""),
+            }
+        )
+
+    edges = []
+    for first in sorted(selected):
+        for second, weight in graph.neighbors(first).items():
+            if second in selected and first < second:
+                edges.append({"from": first, "to": second, "value": weight})
+    return {"nodes": nodes, "edges": edges, "term": term}
+
+======================================================================
 FILE: apps\dashboard\urls.py
 ======================================================================
 from django.urls import path
@@ -4349,68 +4771,1044 @@ from django.urls import path
 from . import views
 
 app_name = "dashboard"
-urlpatterns = [path("", views.home, name="home")]
+
+urlpatterns = [
+    path("", views.home, name="home"),
+    path("schedule/", views.timetable, name="timetable"),
+    path("exams/<str:exam_id>/", views.exam_detail_view, name="exam_detail"),
+    path("students/", views.student_lookup, name="student_lookup"),
+    path("exceptions/", views.exceptions, name="exceptions"),
+    path("validation/", views.validation_page, name="validation"),
+    path("conflict-graph/", views.conflict_graph, name="conflict_graph"),
+    path(
+        "actions/run-scheduler/",
+        views.action_run_scheduler,
+        name="action_run_scheduler",
+    ),
+    path(
+        "actions/validate-data/",
+        views.action_validate_data,
+        name="action_validate_data",
+    ),
+    path(
+        "actions/validate-schedule/",
+        views.action_validate_schedule,
+        name="action_validate_schedule",
+    ),
+    path(
+        "actions/inject-anomalies/",
+        views.action_inject_anomalies,
+        name="action_inject_anomalies",
+    ),
+    path(
+        "actions/detect-violations/",
+        views.action_detect_violations,
+        name="action_detect_violations",
+    ),
+    path(
+        "actions/evaluate-anomalies/",
+        views.action_evaluate_anomalies,
+        name="action_evaluate_anomalies",
+    ),
+    path(
+        "actions/export-data/",
+        views.action_export_data,
+        name="action_export_data",
+    ),
+]
 
 ======================================================================
 FILE: apps\dashboard\views.py
 ======================================================================
-from django.shortcuts import render
+"""Dashboard presentation and staff-only workflow actions."""
 
-from apps.core.models import Course, Exam, Invigilator, Room, Student
+import json
+from pathlib import Path
+
+from django.conf import settings
+from django.contrib import messages
+from django.db import DatabaseError
+from django.shortcuts import redirect, render
+from django.urls import reverse
+from django.utils.http import url_has_allowed_host_and_scheme
+
+from apps.core.models import Exam, Enrollment, Student
+from apps.scheduling.models import (
+    ScheduleAssignment,
+    SchedulerRun,
+)
+from apps.scheduling.services.scheduler import run_scheduler
+from apps.validation.models import ValidationRun
+from apps.validation.services.anomaly_injector import inject
+from apps.validation.services.data_validator import validate_master_data
+from apps.validation.services.evaluator import evaluate, write_evaluation_report
+from apps.validation.services.exporter import (
+    export_csv,
+    export_json,
+    export_sql,
+    write_export_manifest,
+)
+from apps.validation.services.validation_runner import run_all_checks
+
+from .forms import TimetableFilterForm
+from .permissions import staff_required
+from .services import (
+    conflict_graph_data,
+    dashboard_summary,
+    exam_detail,
+    exceptions_rows,
+    latest_run,
+    timetable_rows,
+    validation_page_data,
+)
 
 
 def home(request):
-    """Placeholder landing page. The full dashboard is built in Phase 6."""
-    context = {
-        "counts": [
-            ("Students", Student.objects.count()),
-            ("Courses", Course.objects.count()),
-            ("Exams", Exam.objects.count()),
-            ("Rooms", Room.objects.count()),
-            ("Invigilators", Invigilator.objects.count()),
-        ]
-    }
-    return render(request, "dashboard/home.html", context)
+    return render(request, "dashboard/dashboard.html", dashboard_summary())
+
+
+def timetable(request):
+    run = latest_run()
+    if run is None:
+        return render(
+            request, "dashboard/no_latest_run.html", {"what": "timetable"}
+        )
+    form = TimetableFilterForm(request.GET or None)
+    filters = {}
+    if form.is_valid():
+        filters = {
+            key: value for key, value in form.cleaned_data.items() if value
+        }
+    return render(
+        request,
+        "dashboard/timetable.html",
+        {
+            "run": run,
+            "form": form,
+            "grouped": timetable_rows(run, filters),
+            "filters": filters,
+            "has_filter": bool(filters),
+        },
+    )
+
+
+def exam_detail_view(request, exam_id):
+    exam = (
+        Exam.objects.select_related("course")
+        .filter(pk=exam_id)
+        .first()
+    )
+    if exam is None:
+        return render(
+            request,
+            "dashboard/not_found.html",
+            {"what": f"exam {exam_id}"},
+        )
+    return render(
+        request, "dashboard/exam_detail.html", exam_detail(exam)
+    )
+
+
+def student_lookup(request):
+    query = (request.GET.get("q") or "").strip()
+    student = None
+    enrollments = []
+    assignments = []
+    if query:
+        student = Student.objects.filter(pk=query).first()
+        if student is None:
+            student = Student.objects.filter(email__iexact=query).first()
+        if student:
+            enrollments = list(
+                student.enrollments.select_related("course")
+                .filter(status=Enrollment.Status.ACTIVE)
+                .order_by("course__course_code")
+            )
+            run = latest_run()
+            if run:
+                assignments = list(
+                    ScheduleAssignment.objects.filter(
+                        run=run,
+                        status=ScheduleAssignment.Status.ASSIGNED,
+                        student_allocations__student=student,
+                    )
+                    .select_related("exam__course", "room")
+                    .prefetch_related("invigilator_assignments__invigilator")
+                    .order_by("start_at", "room__room_id")
+                    .distinct()
+                )
+    return render(
+        request,
+        "dashboard/student_lookup.html",
+        {
+            "query": query,
+            "student": student,
+            "enrollments": enrollments,
+            "assignments": assignments,
+            "run": latest_run() if student else None,
+        },
+    )
+
+
+def exceptions(request):
+    run = latest_run()
+    if run is None:
+        return render(
+            request, "dashboard/no_latest_run.html", {"what": "exceptions"}
+        )
+    return render(
+        request,
+        "dashboard/exceptions.html",
+        {"run": run, "rows": exceptions_rows(run)},
+    )
+
+
+def validation_page(request):
+    return render(
+        request, "dashboard/validation.html", validation_page_data()
+    )
+
+
+def conflict_graph(request):
+    return render(
+        request, "dashboard/conflict_graph.html", conflict_graph_data()
+    )
+
+
+def _back(request):
+    fallback = reverse("dashboard:home")
+    candidate = request.POST.get("next") or request.META.get("HTTP_REFERER")
+    if candidate and url_has_allowed_host_and_scheme(
+        candidate,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
+        return candidate
+    return fallback
+
+
+@staff_required
+def action_run_scheduler(request):
+    seed_value = (request.POST.get("seed") or "").strip()
+    try:
+        seed = int(seed_value) if seed_value else None
+    except ValueError:
+        messages.error(request, "Seed must be an integer.")
+        return redirect(_back(request))
+
+    run = run_scheduler(seed=seed)
+    if run.status == SchedulerRun.Status.COMPLETED:
+        messages.success(
+            request, f"Ran scheduler: {run.run_id} — {run.notes}"
+        )
+    else:
+        messages.error(
+            request, f"Scheduler run {run.run_id} ended with status {run.status}."
+        )
+    return redirect(_back(request))
+
+
+@staff_required
+def action_validate_data(request):
+    try:
+        summary = validate_master_data()
+    except OSError as error:
+        messages.error(request, f"Could not write validation report: {error}")
+        return redirect(_back(request))
+    if summary["ok"]:
+        messages.success(
+            request,
+            f"Data validation passed — {len(summary['checks'])} checks, 0 failures.",
+        )
+    else:
+        messages.warning(
+            request,
+            f"Data validation found {summary['failures']} failures; "
+            "see data/validation_summary.json.",
+        )
+    return redirect(_back(request))
+
+
+@staff_required
+def action_validate_schedule(request):
+    run = latest_run()
+    if run is None:
+        messages.error(request, "No scheduler run to validate.")
+        return redirect(_back(request))
+    try:
+        validation_run, result = run_all_checks(run)
+    except (ValueError, OSError, DatabaseError) as error:
+        messages.error(request, f"Schedule validation failed: {error}")
+        return redirect(_back(request))
+    if result["failures"] == 0:
+        messages.success(
+            request, f"{validation_run.validation_id}: PASS — 0 failures."
+        )
+    else:
+        messages.warning(
+            request,
+            f"{validation_run.validation_id}: "
+            f"{result['failures']} violations recorded.",
+        )
+    return redirect(_back(request))
+
+
+@staff_required
+def action_inject_anomalies(request):
+    baseline = (
+        SchedulerRun.objects.filter(
+            run_type=SchedulerRun.RunType.BASELINE,
+            status=SchedulerRun.Status.COMPLETED,
+        )
+        .order_by("-run_id")
+        .first()
+    )
+    if baseline is None:
+        messages.error(request, "No completed BASELINE run to copy.")
+        return redirect(_back(request))
+    try:
+        anomaly_run, labels, _selected = inject(baseline.run_id)
+    except (ValueError, OSError, DatabaseError) as error:
+        messages.error(request, f"Anomaly injection failed: {error}")
+        return redirect(_back(request))
+    messages.success(
+        request,
+        f"Created {anomaly_run.run_id} with {len(labels)} labelled anomalies.",
+    )
+    return redirect(_back(request))
+
+
+@staff_required
+def action_detect_violations(request):
+    run = (
+        SchedulerRun.objects.filter(
+            run_type=SchedulerRun.RunType.ANOMALY_FIXTURE
+        )
+        .order_by("-run_id")
+        .first()
+    )
+    if run is None:
+        messages.error(
+            request, "No ANOMALY_FIXTURE run exists; inject anomalies first."
+        )
+        return redirect(_back(request))
+    try:
+        validation_run, result = run_all_checks(run)
+    except (ValueError, OSError, DatabaseError) as error:
+        messages.error(request, f"Violation detection failed: {error}")
+        return redirect(_back(request))
+    messages.success(
+        request,
+        f"{validation_run.validation_id}: {result['failures']} violations "
+        f"on {run.run_id}.",
+    )
+    return redirect(_back(request))
+
+
+@staff_required
+def action_evaluate_anomalies(request):
+    validation_run = (
+        ValidationRun.objects.filter(
+            scheduler_run__run_type=SchedulerRun.RunType.ANOMALY_FIXTURE
+        )
+        .select_related("scheduler_run")
+        .order_by("-validation_id")
+        .first()
+    )
+    if validation_run is None:
+        messages.error(request, "No anomaly validation yet; detect violations first.")
+        return redirect(_back(request))
+    try:
+        result = evaluate(validation_run)
+        write_evaluation_report(result)
+    except (FileNotFoundError, OSError, ValueError) as error:
+        messages.error(request, f"Evaluation failed: {error}")
+        return redirect(_back(request))
+    messages.success(
+        request,
+        f"Evaluation: TP={result['tp']} FP={result['fp']} FN={result['fn']} "
+        f"P={result['precision']} R={result['recall']} F1={result['f1']}",
+    )
+    return redirect(_back(request))
+
+
+@staff_required
+def action_export_data(request):
+    manifest_path = Path(settings.BASE_DIR) / "data" / "generation_manifest.json"
+    seed = None
+    scale = "unknown"
+    if manifest_path.exists():
+        try:
+            generation_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as error:
+            messages.error(
+                request, f"Could not read generation manifest: {error}"
+            )
+            return redirect(_back(request))
+        seed = generation_manifest.get("seed")
+        scale = generation_manifest.get("scale", "unknown")
+
+    export_dir = Path(settings.BASE_DIR) / "data" / "exports"
+    try:
+        export_csv(export_dir / "csv")
+        export_json(export_dir / "json")
+        export_sql(export_dir / "sql")
+        manifest = write_export_manifest(export_dir, seed=seed, scale=scale)
+    except OSError as error:
+        messages.error(request, f"Export failed: {error}")
+        return redirect(_back(request))
+    messages.success(
+        request,
+        f"Exported {len(manifest['files'])} data files to {export_dir}.",
+    )
+    return redirect(_back(request))
 
 ======================================================================
 FILE: apps\dashboard\__init__.py
 ======================================================================
 
 ======================================================================
+FILE: apps\dashboard\management\__init__.py
+======================================================================
+
+======================================================================
+FILE: apps\dashboard\management\commands\setup_roles.py
+======================================================================
+"""Idempotently create the documented dashboard role groups."""
+
+from django.conf import settings
+from django.contrib.auth.models import Group
+from django.core.management.base import BaseCommand
+
+
+class Command(BaseCommand):
+    help = "Create the five documented dashboard role groups."
+
+    def handle(self, *args, **options):
+        for name in (
+            settings.ROLE_LEARNER,
+            settings.ROLE_INSTRUCTOR,
+            settings.ROLE_ADMINISTRATOR,
+            settings.ROLE_SUPPORT,
+            settings.ROLE_PLATFORM_ADMIN,
+        ):
+            group, created = Group.objects.get_or_create(name=name)
+            status = "CREATED" if created else "exists"
+            self.stdout.write(f"{status:7} {group.name}")
+
+======================================================================
+FILE: apps\dashboard\management\commands\__init__.py
+======================================================================
+
+======================================================================
+FILE: apps\dashboard\static\dashboard\css\custom.css
+======================================================================
+:root {
+  --app-ink: #1d2b3a;
+  --app-muted: #6c7a89;
+  --app-surface: #ffffff;
+  --app-canvas: #f3f6fa;
+  --app-primary: #2356a8;
+}
+
+body {
+  background: var(--app-canvas);
+  color: var(--app-ink);
+}
+
+.app-navbar {
+  background: #14283f;
+  box-shadow: 0 2px 8px rgb(21 39 61 / 15%);
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  min-height: calc(100vh - 56px);
+  background: var(--app-surface);
+  border-right: 1px solid #e1e7ef;
+}
+
+.sidebar-heading {
+  color: var(--app-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.6rem;
+}
+
+.sidebar-link {
+  color: #34465b;
+  display: block;
+  padding: 0.65rem 1rem;
+  text-decoration: none;
+}
+
+.sidebar-link:hover,
+.sidebar-link:focus {
+  background: #edf3fc;
+  color: var(--app-primary);
+}
+
+.page-title {
+  font-size: clamp(1.5rem, 2.5vw, 2rem);
+  font-weight: 700;
+}
+
+.card {
+  border: 1px solid #e3e9f0;
+  border-radius: 0.75rem;
+  box-shadow: 0 3px 12px rgb(29 43 58 / 4%);
+}
+
+.card-header {
+  background: var(--app-surface);
+  border-bottom-color: #e8edf3;
+  padding: 1rem 1.15rem;
+}
+
+.metric-card {
+  height: 100%;
+}
+
+.metric-value {
+  font-size: 1.8rem;
+  font-weight: 700;
+}
+
+.metric-label {
+  color: var(--app-muted);
+  font-size: 0.85rem;
+}
+
+.table > :not(caption) > * > * {
+  padding: 0.8rem;
+}
+
+.graph-canvas {
+  height: min(68vh, 680px);
+  min-height: 360px;
+  border: 1px solid #e3e9f0;
+  border-radius: 0.5rem;
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+footer {
+  gap: 1rem;
+}
+
+@media (max-width: 575.98px) {
+  footer {
+    flex-direction: column;
+  }
+}
+
+======================================================================
+FILE: apps\dashboard\static\dashboard\js\dashboard.js
+======================================================================
+/* Keep shared dashboard JavaScript intentionally small. */
+
+======================================================================
 FILE: apps\dashboard\templates\dashboard\base.html
 ======================================================================
+{% load static dashboard_tags %}
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Exam scheduling operations dashboard">
   <title>{% block title %}Exam Scheduler{% endblock %}</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="{% static 'dashboard/css/custom.css' %}" rel="stylesheet">
+  {% block extra_head %}{% endblock %}
 </head>
-<body class="bg-light">
-  <nav class="navbar navbar-dark bg-dark mb-4">
-    <div class="container"><a class="navbar-brand" href="/">Exam &amp; Room Scheduler</a>
-      <a class="btn btn-outline-light btn-sm" href="/admin/">Admin</a></div>
-  </nav>
-  <main class="container">{% block content %}{% endblock %}</main>
+<body>
+  {% include "dashboard/navbar.html" %}
+  <div class="container-fluid">
+    <div class="row">
+      <aside class="col-lg-2 p-0 d-none d-lg-block">{% include "dashboard/sidebar.html" %}</aside>
+      <main class="col-12 col-lg-10 px-3 px-lg-4 py-4">
+        <div class="d-flex align-items-center justify-content-between mb-4">
+          <h1 class="page-title mb-0">{% block page_title %}Exam scheduling{% endblock %}</h1>
+          {% block page_actions %}{% endblock %}
+        </div>
+        {% if messages %}
+          {% for message in messages %}
+            <div class="alert alert-{{ message.tags|tags_for_bootstrap }} alert-dismissible fade show" role="alert">
+              {{ message }}
+              <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+          {% endfor %}
+        {% endif %}
+        {% block content %}{% endblock %}
+        {% include "dashboard/footer.html" %}
+      </main>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="{% static 'dashboard/js/dashboard.js' %}"></script>
+  {% block extra_js %}{% endblock %}
 </body>
 </html>
 
 ======================================================================
-FILE: apps\dashboard\templates\dashboard\home.html
+FILE: apps\dashboard\templates\dashboard\conflict_graph.html
 ======================================================================
 {% extends "dashboard/base.html" %}
+{% block title %}Conflict graph · Exam Scheduler{% endblock %}
+{% block page_title %}Conflict graph{% endblock %}
+{% block extra_head %}<link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet">{% endblock %}
 {% block content %}
-<h1 class="h3 mb-3">System status</h1>
-<p class="text-muted">Phase 2 placeholder. The full dashboard arrives in Phase 6.</p>
-<div class="row g-3">
-  {% for label, value in counts %}
-  <div class="col-6 col-md-2"><div class="card text-center"><div class="card-body">
-    <div class="fs-3 fw-bold">{{ value }}</div><div class="text-muted small">{{ label }}</div>
-  </div></div></div>
-  {% endfor %}
-</div>
+<div class="card"><div class="card-body"><p class="text-muted">Term {{ term }} · Edges connect exams with shared students; edge weight is the number of shared students. Displaying up to 30 exams with the highest conflict degree.</p>
+  {% if nodes %}<div id="conflict-network" class="graph-canvas" role="img" aria-label="Interactive exam conflict network"></div>
+  {% else %}<div class="alert alert-info mb-0">No exams are available to build the conflict graph.</div>{% endif %}
+</div></div>
+{{ nodes|json_script:"conflict-nodes" }}
+{{ edges|json_script:"conflict-edges" }}
 {% endblock %}
+{% block extra_js %}
+{% if nodes %}
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script>
+  (() => {
+    const nodes = JSON.parse(document.getElementById("conflict-nodes").textContent);
+    const edges = JSON.parse(document.getElementById("conflict-edges").textContent);
+    const graphNodes = nodes.map((node) => ({
+      id: node.id,
+      label: `${node.label}\n${node.course} · degree ${node.degree}`,
+      title: `${node.course} · ${node.enrollment} enrolled${node.slot ? ` · ${node.slot}` : ""}`,
+      value: Math.max(1, node.degree)
+    }));
+    const graphEdges = edges.map((edge) => ({
+      from: edge.from,
+      to: edge.to,
+      value: edge.value,
+      title: `${edge.value} shared student(s)`
+    }));
+    const network = new vis.Network(
+      document.getElementById("conflict-network"),
+      {nodes: new vis.DataSet(graphNodes), edges: new vis.DataSet(graphEdges)},
+      {nodes: {shape: "dot", scaling: {min: 10, max: 30}}, edges: {smooth: true}, physics: {stabilization: true}, interaction: {hover: true}}
+    );
+    network.on("doubleClick", ({nodes: selected}) => {
+      if (selected.length) window.location.href = `/exams/${encodeURIComponent(selected[0])}/`;
+    });
+  })();
+</script>
+{% endif %}
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\dashboard.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}Overview · Exam Scheduler{% endblock %}
+{% block page_title %}Overview{% endblock %}
+{% block content %}
+<section class="row g-3 mb-4" aria-label="Master data summary">
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.students }}</div><div class="metric-label">Students</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.courses }}</div><div class="metric-label">Courses</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.exams }}</div><div class="metric-label">Exams</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.rooms }}</div><div class="metric-label">Rooms</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.invigilators }}</div><div class="metric-label">Invigilators</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.accommodations }}</div><div class="metric-label">Accommodations</div></div></div></div>
+</section>
+
+<div class="row g-4">
+  <div class="col-xl-6">
+    <section class="card h-100">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 class="h5 mb-0">Latest scheduler run</h2>
+        {% if latest_run %}<a class="btn btn-sm btn-outline-primary" href="{% url 'dashboard:timetable' %}">Open timetable</a>{% endif %}
+      </div>
+      <div class="card-body">
+        {% if latest_run %}
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <strong>{{ latest_run.run_id }}</strong>
+            <span class="badge text-bg-secondary">{{ latest_run.run_type }}</span>
+            <span class="badge {% if latest_run.status == 'COMPLETED' %}text-bg-success{% else %}text-bg-warning{% endif %}">{{ latest_run.status }}</span>
+          </div>
+          <p class="small text-muted">Seed {{ latest_run.seed|default:"—" }} · Started {{ latest_run.started_at|date:"Y-m-d H:i" }} · Finished {{ latest_run.finished_at|date:"Y-m-d H:i"|default:"—" }}</p>
+          <div class="row text-center border-top pt-3">
+            <div class="col"><div class="h3 mb-0">{{ scheduled_exams }}</div><div class="small text-muted">Scheduled</div></div>
+            <div class="col"><div class="h3 mb-0 text-warning">{{ unassigned_exams }}</div><div class="small text-muted">Unassigned</div></div>
+            <div class="col"><div class="h3 mb-0">{% if hard_violations is None %}—{% else %}{{ hard_violations }}{% endif %}</div><div class="small text-muted">Violations</div></div>
+          </div>
+          {% if unassigned_reasons %}
+            <hr><h3 class="h6">Unassigned reason breakdown</h3>
+            <ul class="list-unstyled small mb-0">{% for reason, count in unassigned_reasons.items %}<li><code>{{ reason }}</code> <span class="text-muted">({{ count }})</span></li>{% endfor %}</ul>
+          {% endif %}
+        {% else %}
+          <p class="text-muted mb-0">No scheduler runs yet. Load generated data and run the scheduler to get started.</p>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+
+  <div class="col-xl-6">
+    <section class="card h-100">
+      <div class="card-header"><h2 class="h5 mb-0">Business metrics</h2></div>
+      <div class="card-body">
+        {% if metrics %}
+          <div class="row row-cols-2 g-3">
+            <div><div class="metric-label">Scheduling coverage</div><div class="h4">{{ metrics.scheduling_coverage|percent }}</div></div>
+            <div><div class="metric-label">Student allocation</div><div class="h4">{{ metrics.student_allocation_rate|percent }}</div></div>
+            <div><div class="metric-label">Room seat utilization</div><div class="h4">{{ metrics.room_seat_utilization|percent }}</div></div>
+            <div><div class="metric-label">Room time utilization</div><div class="h4">{{ metrics.room_time_utilization|percent }}</div></div>
+            <div><div class="metric-label">Invigilator utilization</div><div class="h4">{{ metrics.invigilator_utilization|percent }}</div></div>
+            <div><div class="metric-label">Exception documentation</div><div class="h4">{{ metrics.exception_documentation_rate|percent }}</div></div>
+          </div>
+          {% if metrics.reconciliation_errors %}<div class="alert alert-danger mt-3 mb-0">Reconciliation errors: {{ metrics.reconciliation_errors|prettyjson }}</div>{% endif %}
+        {% else %}
+          <p class="text-muted mb-0">No matching scorecard yet{% if latest_run %} — validate the latest run to calculate metrics{% endif %}.</p>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+</div>
+
+{% if user|can_run_actions %}
+<section class="card mt-4">
+  <div class="card-header"><h2 class="h5 mb-0">Workflow actions</h2></div>
+  <div class="card-body">
+    <form method="post" action="{% url 'dashboard:action_run_scheduler' %}" class="row g-2 align-items-end mb-3">
+      {% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}">
+      <div class="col-sm-4 col-lg-3"><label class="form-label" for="seed">Optional deterministic seed</label><input id="seed" class="form-control" type="number" name="seed" placeholder="20261022"></div>
+      <div class="col-sm-5 col-lg-4"><button class="btn btn-primary" type="submit">Run scheduler</button></div>
+    </form>
+    <div class="row g-2">
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_validate_data' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-primary w-100" type="submit">Validate data</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_validate_schedule' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-primary w-100" type="submit">Validate schedule</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_inject_anomalies' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-warning w-100" type="submit">Inject anomalies</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_detect_violations' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-warning w-100" type="submit">Detect violations</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_evaluate_anomalies' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-warning w-100" type="submit">Evaluate anomalies</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_export_data' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-secondary w-100" type="submit">Export data</button></form></div>
+    </div>
+    <p class="small text-muted mt-3 mb-0">Actions run synchronously and record results through the same services used by management commands.</p>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\exam_detail.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}{{ exam.exam_id }} · Exam Scheduler{% endblock %}
+{% block page_title %}Exam detail{% endblock %}
+{% block content %}
+<div class="card mb-4">
+  <div class="card-body">
+    <div class="d-flex flex-wrap justify-content-between gap-3">
+      <div><div class="text-muted">{{ exam.exam_id }} · {{ exam.term }}</div><h2 class="h3">{{ exam.title }}</h2><p class="mb-1">{{ exam.course.course_code }} — {{ exam.course.title }}</p><p class="text-muted mb-0">{{ exam.course.get_department_display }} · {{ exam.duration_minutes }} minutes</p></div>
+      <div class="text-end"><span class="badge text-bg-secondary">{{ exam.get_status_display }}</span>{% if run %}<div class="small text-muted mt-2">Run {{ run.run_id }}</div>{% endif %}</div>
+    </div>
+    <hr>
+    <div class="row">
+      <div class="col-md-4"><div class="metric-label">Active enrollments</div><div class="h4">{{ active_enrollments }}</div></div>
+      <div class="col-md-8"><div class="metric-label">Required equipment</div>{% for equipment in required_equipment %}<span class="badge text-bg-light me-1">{{ equipment }}</span>{% empty %}<span class="text-muted">No special equipment</span>{% endfor %}</div>
+    </div>
+  </div>
+</div>
+
+<section class="card mb-4">
+  <div class="card-header"><h2 class="h5 mb-0">Why this assignment?</h2></div>
+  <div class="card-body">
+    {% if events %}
+      {% for event in events %}<div class="border-start border-3 ps-3 mb-3"><strong>{{ event.get_event_type_display }}</strong><div class="small text-muted">{{ event.event_at|date:"Y-m-d H:i:s" }}</div><pre class="small mb-0 mt-2">{{ event.detail|prettyjson }}</pre></div>{% endfor %}
+    {% else %}
+      <p class="text-muted mb-0">No explanation events are recorded for this exam in the latest completed run.</p>
+    {% endif %}
+  </div>
+</section>
+
+{% if assignments %}
+<section class="card mb-4">
+  <div class="card-header"><h2 class="h5 mb-0">Assignments</h2></div>
+  <div class="table-responsive">
+    <table class="table align-middle mb-0"><thead><tr><th>Time</th><th>Room</th><th>Students</th><th>Invigilators</th></tr></thead>
+      <tbody>{% for assignment in assignments %}
+        <tr><td>{{ assignment.start_at|date:"Y-m-d H:i" }}–{{ assignment.end_at|date:"H:i" }}</td><td>{{ assignment.room.room_id }} · {{ assignment.room.building }} {{ assignment.room.room_number }}</td><td>{{ assignment.allocated_count }}</td><td>{% for item in assignment.invigilator_assignments.all %}<div>{{ item.invigilator.full_name }} <span class="text-muted small">{{ item.get_role_display }}</span></div>{% empty %}—{% endfor %}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+  </div>
+</section>
+{% if accommodations %}
+<section class="card mb-4"><div class="card-header"><h2 class="h5 mb-0">Accommodations in this exam</h2></div><ul class="list-group list-group-flush">{% for accommodation in accommodations %}<li class="list-group-item">{{ accommodation.student.student_id }} · {{ accommodation.student.full_name }} — {{ accommodation.get_accommodation_type_display }}{% if accommodation.extra_time_percent %} (+{{ accommodation.extra_time_percent }}% time){% endif %}</li>{% endfor %}</ul></section>
+{% endif %}
+{% if assigned_students %}
+<details class="card mb-4"><summary class="card-header">Assigned students ({{ assigned_students|length }})</summary><div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Student</th><th>Name</th><th>Room</th><th>Required minutes</th></tr></thead><tbody>{% for row in assigned_students %}<tr><td>{{ row.student_id }}</td><td>{{ row.student.full_name }}</td><td>{{ row.assignment.room_id }}</td><td>{{ row.required_minutes }}</td></tr>{% endfor %}</tbody></table></div></details>
+{% endif %}
+{% elif unassigned %}
+<div class="alert alert-warning"><h2 class="h5">Exam unassigned</h2><p><strong>{{ unassigned.get_primary_reason_code_display }}</strong></p><pre class="small mb-0">{{ unassigned.evidence|prettyjson }}</pre></div>
+{% else %}
+<div class="alert alert-info">No assignment record exists for this exam in the latest completed run.</div>
+{% endif %}
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\exceptions.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}Exceptions · Exam Scheduler{% endblock %}
+{% block page_title %}Exceptions centre{% endblock %}
+{% block content %}
+<div class="d-flex gap-2 align-items-center mb-3"><span class="badge text-bg-primary">{{ run.run_id }}</span><span class="badge text-bg-secondary">{{ run.run_type }}</span><span class="text-muted">{{ rows|length }} unassigned exams</span></div>
+{% if rows %}
+<div class="card"><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Exam</th><th>Course</th><th>Primary reason</th><th>Evidence</th></tr></thead><tbody>
+{% for row in rows %}<tr><td><a href="{% url 'dashboard:exam_detail' row.exam_id %}">{{ row.exam_id }}</a></td><td>{{ row.exam.course.course_code }} — {{ row.exam.course.title }}</td><td><span class="badge text-bg-warning">{{ row.get_primary_reason_code_display }}</span></td><td><details><summary>View evidence</summary><pre class="small mt-2 mb-0">{{ row.evidence|prettyjson }}</pre></details></td></tr>{% endfor %}
+</tbody></table></div></div>
+{% else %}<div class="alert alert-success">No unassigned exams in this run.</div>{% endif %}
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\footer.html
+======================================================================
+<footer class="border-top mt-5 pt-3 small text-muted d-flex justify-content-between">
+  <span>Exam &amp; Room Scheduling System</span>
+  <span>Schedule information is read-only in this dashboard.</span>
+</footer>
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\login.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% block title %}Sign in · Exam Scheduler{% endblock %}
+{% block page_title %}Sign in{% endblock %}
+{% block content %}
+<div class="row justify-content-center"><div class="col-md-7 col-lg-5"><div class="card"><div class="card-body p-4">
+  <p class="text-muted">Sign in to access staff workflow actions.</p>
+  {% if form.errors %}<div class="alert alert-danger">Your username and password did not match. Please try again.</div>{% endif %}
+  {% if next and user.is_authenticated %}<div class="alert alert-warning">Your account does not have access to that page.</div>{% endif %}
+  <form method="post" action="{% url 'login' %}">{% csrf_token %}
+    <input type="hidden" name="next" value="{{ next|default:'/' }}">
+    <div class="mb-3"><label class="form-label" for="{{ form.username.id_for_label }}">Username</label><input class="form-control" type="text" name="username" id="{{ form.username.id_for_label }}" autocomplete="username" required autofocus></div>
+    <div class="mb-3"><label class="form-label" for="{{ form.password.id_for_label }}">Password</label><input class="form-control" type="password" name="password" id="{{ form.password.id_for_label }}" autocomplete="current-password" required></div>
+    <button class="btn btn-primary w-100" type="submit">Sign in</button>
+  </form>
+</div></div></div></div>
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\navbar.html
+======================================================================
+{% load dashboard_tags %}
+<nav class="navbar navbar-expand-lg navbar-dark app-navbar">
+  <div class="container-fluid px-3 px-lg-4">
+    <a class="navbar-brand fw-semibold" href="{% url 'dashboard:home' %}">Exam &amp; Room Scheduler</a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNavbar" aria-controls="mainNavbar" aria-expanded="false" aria-label="Toggle navigation">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div class="collapse navbar-collapse" id="mainNavbar">
+      <div class="navbar-nav me-auto d-lg-none">
+        <a class="nav-link" href="{% url 'dashboard:timetable' %}">Timetable</a>
+        <a class="nav-link" href="{% url 'dashboard:student_lookup' %}">Student lookup</a>
+        <a class="nav-link" href="{% url 'dashboard:exceptions' %}">Exceptions</a>
+        <a class="nav-link" href="{% url 'dashboard:validation' %}">Validation</a>
+        <a class="nav-link" href="{% url 'dashboard:conflict_graph' %}">Conflict graph</a>
+      </div>
+      <div class="navbar-nav ms-auto align-items-lg-center gap-lg-2">
+        {% if user.is_authenticated %}
+          <span class="navbar-text small">{{ user.get_username }}</span>
+          <form method="post" action="{% url 'logout' %}" class="d-inline">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-sm btn-outline-light">Sign out</button>
+          </form>
+        {% else %}
+          <a class="btn btn-sm btn-outline-light" href="{% url 'login' %}">Sign in</a>
+        {% endif %}
+        {% if user|can_run_actions %}<a class="btn btn-sm btn-outline-light" href="/admin/">Admin</a>{% endif %}
+      </div>
+    </div>
+  </div>
+</nav>
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\not_found.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% block title %}Not found · Exam Scheduler{% endblock %}
+{% block page_title %}No record found{% endblock %}
+{% block content %}
+<div class="alert alert-warning">No record found for {{ what }}.</div>
+<a href="{% url 'dashboard:home' %}" class="btn btn-outline-primary">Back to overview</a>
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\no_latest_run.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% block title %}No schedule · Exam Scheduler{% endblock %}
+{% block page_title %}{{ what|title }}{% endblock %}
+{% block content %}
+<div class="empty-state card"><div class="card-body text-center py-5"><h2 class="h4">This {{ what }} needs a scheduler run</h2><p class="text-muted">Generate the master data and run the scheduler to create a schedule that can be displayed here.</p><a class="btn btn-primary" href="{% url 'dashboard:home' %}">Back to overview</a></div></div>
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\sidebar.html
+======================================================================
+{% load dashboard_tags %}
+<nav class="sidebar py-4" aria-label="Main navigation">
+  <div class="px-3 text-uppercase sidebar-heading">Workspace</div>
+  <a class="sidebar-link" href="{% url 'dashboard:home' %}">Overview</a>
+  <a class="sidebar-link" href="{% url 'dashboard:timetable' %}">Timetable</a>
+  <a class="sidebar-link" href="{% url 'dashboard:student_lookup' %}">Student lookup</a>
+  <a class="sidebar-link" href="{% url 'dashboard:exceptions' %}">Exceptions</a>
+  <a class="sidebar-link" href="{% url 'dashboard:validation' %}">Validation</a>
+  <a class="sidebar-link" href="{% url 'dashboard:conflict_graph' %}">Conflict graph</a>
+  {% if user|can_run_actions %}
+    <div class="px-3 mt-4 text-uppercase sidebar-heading">Administration</div>
+    <a class="sidebar-link" href="/admin/">Django admin</a>
+  {% endif %}
+</nav>
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\student_lookup.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% block title %}Student lookup · Exam Scheduler{% endblock %}
+{% block page_title %}Student lookup{% endblock %}
+{% block content %}
+<section class="card mb-4"><div class="card-body"><form method="get" class="row g-2 align-items-end"><div class="col-sm-8 col-lg-5"><label class="form-label" for="student-query">Student ID or email</label><input id="student-query" class="form-control" type="search" name="q" value="{{ query }}" placeholder="STU-000001 or name@example.edu"></div><div class="col-auto"><button class="btn btn-primary" type="submit">Search</button></div></form></div></section>
+{% if query %}
+  {% if student %}
+  <section class="card mb-4"><div class="card-body"><h2 class="h4">{{ student.full_name }}</h2><div>{{ student.student_id }} · {{ student.email }}</div><div class="text-muted">{{ student.get_department_display }} · Year {{ student.year_level }} · {{ student.get_status_display }}</div></div></section>
+  <section class="card mb-4"><div class="card-header"><h2 class="h5 mb-0">Enrollments</h2></div>{% if enrollments %}<div class="table-responsive"><table class="table mb-0"><thead><tr><th>Course</th><th>Title</th><th>Term</th></tr></thead><tbody>{% for enrollment in enrollments %}<tr><td>{{ enrollment.course.course_code }}</td><td>{{ enrollment.course.title }}</td><td>{{ enrollment.term }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="card-body text-muted">No active enrollments found.</div>{% endif %}</section>
+  <section class="card"><div class="card-header"><h2 class="h5 mb-0">Personal timetable{% if run %} · {{ run.run_id }}{% endif %}</h2></div>{% if assignments %}<div class="table-responsive"><table class="table table-hover mb-0"><thead><tr><th>Date and time</th><th>Exam</th><th>Course</th><th>Room</th></tr></thead><tbody>{% for assignment in assignments %}<tr><td>{{ assignment.start_at|date:"Y-m-d H:i" }}–{{ assignment.end_at|date:"H:i" }}</td><td><a href="{% url 'dashboard:exam_detail' assignment.exam_id %}">{{ assignment.exam_id }}</a></td><td>{{ assignment.exam.course.course_code }}</td><td>{{ assignment.room.room_id }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="card-body text-muted">No scheduled exam allocations found for this student.</div>{% endif %}</section>
+  {% else %}<div class="alert alert-warning">No student found for “{{ query }}”.</div>{% endif %}
+{% endif %}
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\timetable.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}Timetable · Exam Scheduler{% endblock %}
+{% block page_title %}Timetable{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+  <span class="badge text-bg-primary">{{ run.run_id }}</span>
+  <span class="badge text-bg-secondary">{{ run.run_type }}</span>
+  <span class="text-muted small">{{ run.status }} · {{ run.started_at|date:"Y-m-d H:i" }}</span>
+</div>
+<section class="card mb-4">
+  <div class="card-body">
+    <form method="get" class="row g-3">
+      {% for field in form %}
+        <div class="col-md-4 col-xl-2">
+          <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+          {{ field }}
+          {% for error in field.errors %}<div class="invalid-feedback d-block">{{ error }}</div>{% endfor %}
+        </div>
+      {% endfor %}
+      <div class="col-12 d-flex gap-2">
+        <button class="btn btn-primary" type="submit">Apply filters</button>
+        <a class="btn btn-outline-secondary" href="{% url 'dashboard:timetable' %}">Clear</a>
+      </div>
+    </form>
+  </div>
+</section>
+{% if grouped %}
+  {% for date, assignments in grouped.items %}
+  <section class="card mb-4">
+    <div class="card-header d-flex justify-content-between"><h2 class="h5 mb-0">{{ date|date:"l, F j, Y" }}</h2><span class="badge text-bg-light">{{ assignments|length }} room assignments</span></div>
+    <div class="table-responsive">
+      <table class="table table-hover align-middle mb-0">
+        <thead><tr><th>Time</th><th>Exam / course</th><th>Room</th><th>Students</th><th>Invigilators</th></tr></thead>
+        <tbody>
+          {% for assignment in assignments %}
+          <tr>
+            <td class="text-nowrap">{{ assignment.start_at|date:"H:i" }}–{{ assignment.end_at|date:"H:i" }}</td>
+            <td><a href="{% url 'dashboard:exam_detail' assignment.exam_id %}">{{ assignment.exam_id }}</a><div class="small text-muted">{{ assignment.exam.course.course_code }} · {{ assignment.exam.course.title }}</div></td>
+            <td>{{ assignment.room.room_id }}<div class="small text-muted">{{ assignment.room.building }} {{ assignment.room.room_number }}</div></td>
+            <td>{{ assignment.allocated_count }}</td>
+            <td>{% for item in assignment.invigilator_assignments.all %}<span class="d-block">{{ item.invigilator.full_name }}</span>{% empty %}<span class="text-muted">—</span>{% endfor %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endfor %}
+{% else %}
+  <div class="alert alert-info">{% if has_filter %}No assignments match these filters.{% else %}This run has no assigned exams.{% endif %}</div>
+{% endif %}
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templates\dashboard\validation.html
+======================================================================
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}Validation · Exam Scheduler{% endblock %}
+{% block page_title %}Validation scorecard{% endblock %}
+{% block content %}
+{% if latest_validation %}
+  <div class="d-flex flex-wrap gap-2 align-items-center mb-3"><span class="badge text-bg-primary">{{ latest_validation.validation_id }}</span><span class="badge text-bg-secondary">{{ latest_validation.scheduler_run_id }}</span><span class="badge {% if latest_validation.status == 'PASSED' %}text-bg-success{% else %}text-bg-warning{% endif %}">{{ latest_validation.get_status_display }}</span></div>
+  <div class="row g-3 mb-4"><div class="col-sm-4"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ latest_validation.checks_performed }}</div><div class="metric-label">Checks performed</div></div></div></div><div class="col-sm-4"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ latest_validation.failures }}</div><div class="metric-label">Violations</div></div></div></div><div class="col-sm-4"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ latest_validation.finished_at|date:"H:i"|default:"—" }}</div><div class="metric-label">Finished</div></div></div></div></div>
+  {% if scorecard and scorecard.checks %}
+  <section class="card mb-4"><div class="card-header"><h2 class="h5 mb-0">Independent checks</h2></div><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Check</th><th>Inspected</th><th>Failures</th><th>Status</th></tr></thead><tbody>{% for check in scorecard.checks %}<tr><td>{{ check.check }}</td><td>{{ check.checks_performed }}</td><td>{{ check.failures }}</td><td><span class="badge {% if check.status == 'PASS' %}text-bg-success{% else %}text-bg-danger{% endif %}">{{ check.status }}</span></td></tr>{% endfor %}</tbody></table></div></section>
+  {% endif %}
+  <section class="card mb-4"><div class="card-header"><h2 class="h5 mb-0">Detected violations ({{ violations|length }})</h2></div>{% if violations %}<div class="table-responsive"><table class="table table-hover mb-0"><thead><tr><th>Code</th><th>Exam</th><th>Room</th><th>Entity</th><th>Details</th></tr></thead><tbody>{% for violation in violations %}<tr><td><code>{{ violation.violation_code }}</code></td><td>{% if violation.assignment %}<a href="{% url 'dashboard:exam_detail' violation.assignment.exam_id %}">{{ violation.assignment.exam_id }}</a>{% else %}—{% endif %}</td><td>{{ violation.assignment.room_id|default:"—" }}</td><td>{{ violation.entity_id|default:"—" }}</td><td>{{ violation.detail }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="card-body text-success">No violations recorded.</div>{% endif %}</section>
+{% else %}
+  <div class="alert alert-info">No validation runs yet. Run schedule validation from the overview or management command.</div>
+{% endif %}
+<section class="card"><div class="card-header"><h2 class="h5 mb-0">Validation history</h2></div>{% if history %}<div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>ID</th><th>Scheduler run</th><th>Started</th><th>Status</th><th>Checks</th><th>Violations</th></tr></thead><tbody>{% for item in history %}<tr><td>{{ item.validation_id }}</td><td>{{ item.scheduler_run_id }}</td><td>{{ item.started_at|date:"Y-m-d H:i" }}</td><td>{{ item.get_status_display }}</td><td>{{ item.checks_performed }}</td><td>{{ item.failures }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="card-body text-muted">No history.</div>{% endif %}</section>
+{% endblock %}
+
+======================================================================
+FILE: apps\dashboard\templatetags\dashboard_tags.py
+======================================================================
+"""Small template filters used by the dashboard."""
+
+import json
+
+from django import template
+
+from apps.dashboard.permissions import can_run_actions as user_can_run_actions
+
+register = template.Library()
+
+
+@register.filter
+def prettyjson(value):
+    try:
+        return json.dumps(value, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+@register.filter
+def tags_for_bootstrap(tags: str) -> str:
+    return {"error": "danger", "debug": "secondary"}.get(tags, tags)
+
+
+@register.filter
+def percent(value):
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+@register.filter
+def can_run_actions(user):
+    return user_can_run_actions(user)
+
+======================================================================
+FILE: apps\dashboard\templatetags\__init__.py
+======================================================================
 
 ======================================================================
 FILE: apps\scheduling\admin.py
@@ -9601,6 +10999,8 @@ FILE: config\settings.py
 import os
 from pathlib import Path
 
+from django.contrib.messages import constants as message_constants
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Development key. Override with an environment variable in any real deployment.
@@ -9671,8 +11071,23 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-LOGIN_URL = "/admin/login/"
+LOGIN_URL = "/accounts/login/"
 LOGIN_REDIRECT_URL = "/"
+LOGOUT_REDIRECT_URL = "/"
+
+MESSAGE_TAGS = {
+    message_constants.DEBUG: "secondary",
+    message_constants.INFO: "info",
+    message_constants.SUCCESS: "success",
+    message_constants.WARNING: "warning",
+    message_constants.ERROR: "danger",
+}
+
+ROLE_LEARNER = "Learner"
+ROLE_INSTRUCTOR = "Instructor"
+ROLE_ADMINISTRATOR = "Academic Administrator"
+ROLE_SUPPORT = "Support Staff"
+ROLE_PLATFORM_ADMIN = "Platform Administrator"
 
 LOGGING = {
     "version": 1,
@@ -9701,10 +11116,24 @@ SCHEDULER_POLICY = {
 FILE: config\urls.py
 ======================================================================
 from django.contrib import admin
+from django.contrib.auth import views as auth_views
 from django.urls import include, path
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path(
+        "accounts/login/",
+        auth_views.LoginView.as_view(
+            template_name="dashboard/login.html",
+            redirect_authenticated_user=True,
+        ),
+        name="login",
+    ),
+    path(
+        "accounts/logout/",
+        auth_views.LogoutView.as_view(next_page="dashboard:home"),
+        name="logout",
+    ),
     path("", include("apps.dashboard.urls")),
 ]
 
@@ -9719,6 +11148,54 @@ application = get_wsgi_application()
 ======================================================================
 FILE: config\__init__.py
 ======================================================================
+
+======================================================================
+FILE: data\anomaly_evaluation.json
+======================================================================
+{
+  "validation_id": "VAL-000002",
+  "scheduler_run": "RUN-000003",
+  "ground_truth_count": 7,
+  "detected_count": 7,
+  "tp": 7,
+  "fp": 0,
+  "fn": 0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "true_positives": [
+    [
+      "ASN-EXAM-2026-000001-ROOM-000005-RUN-000003",
+      "STUDENT_DOUBLE_BOOKING"
+    ],
+    [
+      "ASN-EXAM-2026-000002-ROOM-000097-RUN-000003",
+      "STUDENT_DOUBLE_BOOKING"
+    ],
+    [
+      "ASN-EXAM-2026-000003-ROOM-000005-RUN-000003",
+      "ROOM_CAPACITY_EXCEEDED"
+    ],
+    [
+      "ASN-EXAM-2026-000006-ROOM-000003-RUN-000003",
+      "INVIGILATOR_DOUBLE_BOOKED"
+    ],
+    [
+      "ASN-EXAM-2026-000007-ROOM-000075-RUN-000003",
+      "INVIGILATOR_DOUBLE_BOOKED"
+    ],
+    [
+      "ASN-EXAM-2026-000013-ROOM-000070-RUN-000003",
+      "ACCOMMODATION_VIOLATION"
+    ],
+    [
+      "ASN-EXAM-2026-000014-ROOM-000057-RUN-000003",
+      "ROOM_UNAVAILABLE_VIOLATION"
+    ]
+  ],
+  "false_positives": [],
+  "false_negatives": []
+}
 
 ======================================================================
 FILE: data\ground_truth.json
@@ -9768,7 +11245,7 @@ FILE: data\ground_truth.json
     "anomaly_id": "EDGE-004",
     "issue_type": "ACCOMMODATION_BREACH",
     "assignment_id": "ASN-EXAM-2026-000003-ROOM-000001-RUN-000002",
-    "affected_entity_id": "STU-000017",
+    "affected_entity_id": "STU-000047",
     "expected_violation_code": "ACCOMMODATION_VIOLATION",
     "run_id": "RUN-000002"
   },
@@ -9831,85 +11308,85 @@ FILE: data\reproducibility_report.json
 FILE: data\validation_scorecard.json
 ======================================================================
 {
-  "validation_id": "VAL-000001",
-  "scheduler_run": "RUN-000001",
-  "status": "PASSED",
-  "checks_performed": 1502,
-  "failures": 0,
+  "validation_id": "VAL-000002",
+  "scheduler_run": "RUN-000003",
+  "status": "FAILED_CHECKS",
+  "checks_performed": 1256,
+  "failures": 7,
   "checks": [
     {
       "check": "student_double_booking",
-      "checks_performed": 632,
-      "failures": 0,
-      "status": "PASS"
+      "checks_performed": 557,
+      "failures": 2,
+      "status": "FAIL"
     },
     {
       "check": "room_capacity",
-      "checks_performed": 29,
-      "failures": 0,
-      "status": "PASS"
+      "checks_performed": 17,
+      "failures": 1,
+      "status": "FAIL"
     },
     {
       "check": "missing_equipment",
-      "checks_performed": 29,
+      "checks_performed": 17,
       "failures": 0,
       "status": "PASS"
     },
     {
       "check": "room_double_booked",
-      "checks_performed": 29,
+      "checks_performed": 17,
       "failures": 0,
       "status": "PASS"
     },
     {
       "check": "invigilator_double_booked",
-      "checks_performed": 32,
-      "failures": 0,
-      "status": "PASS"
+      "checks_performed": 20,
+      "failures": 2,
+      "status": "FAIL"
     },
     {
       "check": "invigilator_unavailable",
-      "checks_performed": 32,
+      "checks_performed": 20,
       "failures": 0,
       "status": "PASS"
     },
     {
       "check": "accommodation_violation",
-      "checks_performed": 632,
-      "failures": 0,
-      "status": "PASS"
+      "checks_performed": 557,
+      "failures": 1,
+      "status": "FAIL"
     },
     {
       "check": "room_unavailable",
-      "checks_performed": 29,
-      "failures": 0,
-      "status": "PASS"
+      "checks_performed": 17,
+      "failures": 1,
+      "status": "FAIL"
     },
     {
       "check": "student_allocation_mismatch",
-      "checks_performed": 29,
+      "checks_performed": 17,
       "failures": 0,
       "status": "PASS"
     },
     {
       "check": "invalid_duration",
-      "checks_performed": 29,
+      "checks_performed": 17,
       "failures": 0,
       "status": "PASS"
     }
   ],
   "business_metrics": {
-    "scheduler_run": "RUN-000001",
+    "scheduler_run": "RUN-000003",
     "term": "2026-FALL",
-    "total_exams": 20,
-    "term_exam_count": 20,
-    "scheduled_exams": 15,
-    "unassigned_exams": 5,
-    "scheduling_coverage": 0.75,
+    "total_exams": 7,
+    "term_exam_count": 300,
+    "scheduled_exams": 7,
+    "unassigned_exams": 0,
+    "scheduling_coverage": 1.0,
     "student_allocation_rate": 1.0,
-    "room_seat_utilization": 0.1132,
-    "room_time_utilization": 0.0829,
-    "invigilator_utilization": 0.0944,
+    "room_seat_utilization": 0.6793,
+    "room_time_utilization": 0.019,
+    "invigilator_utilization": 0.1421,
     "exception_documentation_rate": 1.0,
     "reconciliation_ok": true,
     "reconciliation_errors": []
@@ -18017,8 +19494,8 @@ FILE: docs\architecture.md
 | `apps/core` | Master data models, ID generator, data generator service, export command |
 | `apps/scheduling` | Scheduling models, conflict graph, slot/room/invigilator allocators, accommodation logic, explanations, `run_scheduler` |
 | `apps/validation` | `ValidationRun`, `DetectedViolation`, independent schedule checks, anomaly fixtures, evaluator, and business metrics |
-| `apps/dashboard` | Views, forms, templates, static files |
-| `apps/accounts` | Groups and permissions for the five actors |
+| `apps/dashboard` | Read-only dashboard views, filters, workflow actions, role helpers, templates, and static files |
+| Django auth groups | Learner, Instructor, Academic Administrator, Support Staff, and Platform Administrator role labels |
 | `generator/` | Pure-Python seeded generation logic (config, master data, enrollments, anomalies) |
 
 ## 4. Why the validator is independent
@@ -18038,11 +19515,16 @@ The baseline is never modified by the anomaly commands.
 
 | Actor | Responsibility | Access |
 |---|---|---|
-| Learner | View personal exam timetable | Own timetable only |
-| Instructor | View own courses and exams | Read-only, own courses |
-| Academic Administrator | Generate data, schedule, resolve exceptions | Run actions, exceptions |
-| Support Staff | Manage accommodation and accessibility info | Accommodation records |
-| Platform Administrator | Users, permissions, settings | Full |
+| Learner | View exam information | Read-only dashboard pages |
+| Instructor | View course and exam information | Read-only dashboard pages |
+| Academic Administrator | Run scheduling and validation workflows | Staff actions and exceptions |
+| Support Staff | Review accommodation and accessibility information | Read-only dashboard pages |
+| Platform Administrator | Users, permissions, settings | Django admin and staff actions |
+
+Dashboard pages are intentionally readable without login for demonstrations.
+Mutating workflow actions require a POST request and either Django staff status
+or membership in the Academic Administrator group. Internal record management
+remains in Django admin.
 
 ## 7. Technology notes
 
@@ -20745,17 +22227,285 @@ class ScheduleValidatorTests(TestCase):
 ======================================================================
 FILE: tests\test_views.py
 ======================================================================
-from django.test import TestCase
+import tempfile
+from pathlib import Path
+
+from django.contrib.auth.models import Group, User
+from django.core.management import call_command
+from django.test import Client, TestCase, override_settings
+from django.urls import reverse
+
+from apps.core.services.data_generator import generate_and_persist
+from apps.scheduling.models import ScheduleAssignment
+from apps.scheduling.services.scheduler import run_scheduler
+from generator.config import SEED_DEFAULT
 
 
-class HomeViewTests(TestCase):
-    def test_home_page_loads(self):
-        response = self.client.get("/")
+class PublicPagesTests(TestCase):
+    def test_dashboard_loads_anonymously(self):
+        response = self.client.get(reverse("dashboard:home"))
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "System status")
+        self.assertContains(response, "Overview")
+        self.assertNotContains(response, "Workflow actions")
+
+    def test_login_page_loads(self):
+        response = self.client.get(reverse("login"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Sign in")
+
+    def test_timetable_shows_empty_state_without_run(self):
+        response = self.client.get(reverse("dashboard:timetable"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "needs a scheduler run")
 
     def test_admin_login_page_loads(self):
         self.assertEqual(self.client.get("/admin/login/").status_code, 200)
+
+
+class PopulatedPagesTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        cls.scheduler_run = run_scheduler(seed=SEED_DEFAULT)
+        cls.assignment = (
+            ScheduleAssignment.objects.filter(run=cls.scheduler_run)
+            .order_by("start_at")
+            .first()
+        )
+
+    def test_dashboard_shows_latest_run_and_business_metrics(self):
+        response = self.client.get(reverse("dashboard:home"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.scheduler_run.run_id)
+        self.assertContains(response, "Business metrics")
+
+    def test_timetable_lists_assigned_exam(self):
+        response = self.client.get(reverse("dashboard:timetable"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.assignment.exam_id)
+
+    def test_timetable_filter_by_exam_id(self):
+        response = self.client.get(
+            reverse("dashboard:timetable"), {"exam": self.assignment.exam_id}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.assignment.exam_id)
+
+    def test_timetable_filter_with_invalid_date_is_safe(self):
+        response = self.client.get(
+            reverse("dashboard:timetable"), {"date": "not-a-date"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Enter a valid date")
+
+    def test_exam_detail_renders_assignment_explanation(self):
+        response = self.client.get(
+            reverse("dashboard:exam_detail", args=[self.assignment.exam_id])
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Why this assignment?")
+
+    def test_exam_detail_unknown_id_returns_not_found_page(self):
+        response = self.client.get(
+            reverse(
+                "dashboard:exam_detail",
+                args=["EXAM-9999-000001"],
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "No record found")
+
+    def test_student_lookup_returns_enrollments(self):
+        response = self.client.get(
+            reverse("dashboard:student_lookup"), {"q": "STU-000001"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Enrollments")
+
+    def test_student_lookup_accepts_email(self):
+        from apps.core.models import Student
+
+        email = Student.objects.get(pk="STU-000001").email
+        response = self.client.get(
+            reverse("dashboard:student_lookup"), {"q": email}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Personal timetable")
+
+    def test_exceptions_page_loads(self):
+        response = self.client.get(reverse("dashboard:exceptions"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_validation_page_loads(self):
+        response = self.client.get(reverse("dashboard:validation"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Validation scorecard")
+
+    def test_conflict_graph_page_loads(self):
+        response = self.client.get(reverse("dashboard:conflict_graph"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Conflict graph")
+
+
+class ActionPermissionTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        cls.scheduler_run = run_scheduler(seed=SEED_DEFAULT)
+
+    def setUp(self):
+        self.output_dir = tempfile.TemporaryDirectory(prefix="dashboard_test_")
+        self.settings_override = override_settings(
+            BASE_DIR=Path(self.output_dir.name)
+        )
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        self.output_dir.cleanup()
+
+    def test_anonymous_cannot_run_scheduler(self):
+        response = self.client.post(reverse("dashboard:action_run_scheduler"))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/accounts/login/", response.url)
+
+    def test_non_staff_user_cannot_run_scheduler(self):
+        user = User.objects.create_user(username="alice", password="test-pass-123")
+        self.client.force_login(user)
+        response = self.client.post(
+            reverse("dashboard:action_run_scheduler"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "requires the Academic Administrator role")
+        self.assertNotContains(response, "Workflow actions")
+
+    def test_action_is_post_only(self):
+        staff = User.objects.create_user(
+            username="staff-get", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+        response = self.client.get(reverse("dashboard:action_run_scheduler"))
+        self.assertEqual(response.status_code, 405)
+
+    def test_action_requires_csrf_token(self):
+        staff = User.objects.create_user(
+            username="staff-csrf", password="test-pass-123", is_staff=True
+        )
+        csrf_client = Client(enforce_csrf_checks=True)
+        csrf_client.force_login(staff)
+        response = csrf_client.post(reverse("dashboard:action_run_scheduler"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_external_next_url_is_not_followed(self):
+        staff = User.objects.create_user(
+            username="staff-next", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+        dashboard = self.client.get(reverse("dashboard:home"))
+        self.assertContains(dashboard, "Workflow actions")
+        response = self.client.post(
+            reverse("dashboard:action_run_scheduler"),
+            {"seed": "invalid", "next": "https://example.invalid/"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, reverse("dashboard:home"))
+
+    def test_invalid_seed_is_reported(self):
+        staff = User.objects.create_user(
+            username="staff-invalid-seed", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+        response = self.client.post(
+            reverse("dashboard:action_run_scheduler"),
+            {"seed": "not-an-integer"},
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Seed must be an integer.")
+
+    def test_staff_can_run_scheduler(self):
+        staff = User.objects.create_user(
+            username="staff-run", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+        response = self.client.post(
+            reverse("dashboard:action_run_scheduler"),
+            {"seed": str(SEED_DEFAULT)},
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Ran scheduler")
+
+    def test_academic_administrator_group_can_run_actions(self):
+        call_command("setup_roles", verbosity=0)
+        user = User.objects.create_user(username="academic-admin", password="test-pass-123")
+        user.groups.add(Group.objects.get(name="Academic Administrator"))
+        self.client.force_login(user)
+        response = self.client.post(
+            reverse("dashboard:action_run_scheduler"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Ran scheduler")
+
+    def test_staff_can_validate_schedule(self):
+        staff = User.objects.create_user(
+            username="staff-validate", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+        response = self.client.post(
+            reverse("dashboard:action_validate_schedule"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "VAL-")
+
+    def test_staff_can_validate_master_data(self):
+        staff = User.objects.create_user(
+            username="staff-data-check", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+        response = self.client.post(
+            reverse("dashboard:action_validate_data"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Data validation passed")
+
+    def test_staff_can_export_data(self):
+        staff = User.objects.create_user(
+            username="staff-export", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+        response = self.client.post(
+            reverse("dashboard:action_export_data"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Exported")
+        self.assertTrue(
+            (Path(self.output_dir.name) / "data" / "exports" / "manifest.json").exists()
+        )
+
+    def test_staff_can_run_complete_anomaly_workflow(self):
+        staff = User.objects.create_user(
+            username="staff-anomalies", password="test-pass-123", is_staff=True
+        )
+        self.client.force_login(staff)
+
+        response = self.client.post(
+            reverse("dashboard:action_inject_anomalies"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "labelled anomalies")
+
+        response = self.client.post(
+            reverse("dashboard:action_detect_violations"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "violations on RUN-")
+
+        response = self.client.post(
+            reverse("dashboard:action_evaluate_anomalies"), follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Evaluation: TP=")
 
 ======================================================================
 FILE: tests\__init__.py

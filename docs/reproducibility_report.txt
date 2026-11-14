@@ -1,0 +1,58 @@
+Reproducibility Report
+======================
+
+Recorded result: 2026-11-14
+Seed: 20261022
+Scale: full
+
+Command
+-------
+python manage.py verify_reproducibility --seed 20261022 --scale full
+
+Observed result
+---------------
+checksum_run_1 = 0d9535f6b08ee3546b61ff50140d17f1da73e2349937dc6f1c358491696d5b6f
+checksum_run_2 = 0d9535f6b08ee3546b61ff50140d17f1da73e2349937dc6f1c358491696d5b6f
+match          = true
+
+Row counts (identical for both runs)
+------------------------------------
+core_equipment                    5
+core_student                   5000
+core_course                     300
+core_room                       100
+core_invigilator                200
+scheduling_timeslot              40
+core_roomcapacity                100
+core_roomequipment               193
+scheduling_availability         1186
+scheduling_roomclosure             5
+core_accommodation               450
+core_enrollment                24959
+core_exam                        300
+core_examrequirement             300
+core_examrequirementequipment    297
+
+Method
+------
+The reproducibility service generates the selected data scale twice using the
+same seed. It takes a canonical SHA-256 snapshot of rows ordered by primary
+key, serializing each row as sorted-key JSON and adding a newline separator.
+It also compares per-table row counts. Each temporary generation is rolled
+back to its savepoint; existing generated data is not replaced.
+
+Interpretation
+--------------
+The two observed full-scale runs produced identical row counts and checksums.
+The test suite also checks that different seeds produce different checksums.
+For the current implementation, this is evidence of deterministic synthetic
+master-data generation for the tested seed and environment, not a promise that
+every future code version will retain the same checksum.
+
+Constraints
+-----------
+- Verification refuses to run if append-only ScheduleEvent rows exist. Run it
+  before scheduling on a fresh database.
+- The report is a recorded observation. Re-run the command to verify the
+  current code and environment; the machine-readable output is written to
+  data/reproducibility_report.json.

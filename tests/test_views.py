@@ -103,6 +103,13 @@ class PopulatedPagesTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Personal timetable")
 
+    def test_student_lookup_unknown_id_is_friendly(self):
+        response = self.client.get(
+            reverse("dashboard:student_lookup"), {"q": "STU-999999"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "No student found")
+
     def test_exceptions_page_loads(self):
         response = self.client.get(reverse("dashboard:exceptions"))
         self.assertEqual(response.status_code, 200)
