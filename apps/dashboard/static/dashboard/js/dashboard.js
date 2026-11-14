@@ -1,0 +1,1 @@
+/* Keep shared dashboard JavaScript intentionally small. */

@@ -1,0 +1,89 @@
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}Overview · Exam Scheduler{% endblock %}
+{% block page_title %}Overview{% endblock %}
+{% block content %}
+<section class="row g-3 mb-4" aria-label="Master data summary">
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.students }}</div><div class="metric-label">Students</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.courses }}</div><div class="metric-label">Courses</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.exams }}</div><div class="metric-label">Exams</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.rooms }}</div><div class="metric-label">Rooms</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.invigilators }}</div><div class="metric-label">Invigilators</div></div></div></div>
+  <div class="col-6 col-xl-2"><div class="card metric-card"><div class="card-body"><div class="metric-value">{{ counts.accommodations }}</div><div class="metric-label">Accommodations</div></div></div></div>
+</section>
+
+<div class="row g-4">
+  <div class="col-xl-6">
+    <section class="card h-100">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 class="h5 mb-0">Latest scheduler run</h2>
+        {% if latest_run %}<a class="btn btn-sm btn-outline-primary" href="{% url 'dashboard:timetable' %}">Open timetable</a>{% endif %}
+      </div>
+      <div class="card-body">
+        {% if latest_run %}
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <strong>{{ latest_run.run_id }}</strong>
+            <span class="badge text-bg-secondary">{{ latest_run.run_type }}</span>
+            <span class="badge {% if latest_run.status == 'COMPLETED' %}text-bg-success{% else %}text-bg-warning{% endif %}">{{ latest_run.status }}</span>
+          </div>
+          <p class="small text-muted">Seed {{ latest_run.seed|default:"—" }} · Started {{ latest_run.started_at|date:"Y-m-d H:i" }} · Finished {{ latest_run.finished_at|date:"Y-m-d H:i"|default:"—" }}</p>
+          <div class="row text-center border-top pt-3">
+            <div class="col"><div class="h3 mb-0">{{ scheduled_exams }}</div><div class="small text-muted">Scheduled</div></div>
+            <div class="col"><div class="h3 mb-0 text-warning">{{ unassigned_exams }}</div><div class="small text-muted">Unassigned</div></div>
+            <div class="col"><div class="h3 mb-0">{% if hard_violations is None %}—{% else %}{{ hard_violations }}{% endif %}</div><div class="small text-muted">Violations</div></div>
+          </div>
+          {% if unassigned_reasons %}
+            <hr><h3 class="h6">Unassigned reason breakdown</h3>
+            <ul class="list-unstyled small mb-0">{% for reason, count in unassigned_reasons.items %}<li><code>{{ reason }}</code> <span class="text-muted">({{ count }})</span></li>{% endfor %}</ul>
+          {% endif %}
+        {% else %}
+          <p class="text-muted mb-0">No scheduler runs yet. Load generated data and run the scheduler to get started.</p>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+
+  <div class="col-xl-6">
+    <section class="card h-100">
+      <div class="card-header"><h2 class="h5 mb-0">Business metrics</h2></div>
+      <div class="card-body">
+        {% if metrics %}
+          <div class="row row-cols-2 g-3">
+            <div><div class="metric-label">Scheduling coverage</div><div class="h4">{{ metrics.scheduling_coverage|percent }}</div></div>
+            <div><div class="metric-label">Student allocation</div><div class="h4">{{ metrics.student_allocation_rate|percent }}</div></div>
+            <div><div class="metric-label">Room seat utilization</div><div class="h4">{{ metrics.room_seat_utilization|percent }}</div></div>
+            <div><div class="metric-label">Room time utilization</div><div class="h4">{{ metrics.room_time_utilization|percent }}</div></div>
+            <div><div class="metric-label">Invigilator utilization</div><div class="h4">{{ metrics.invigilator_utilization|percent }}</div></div>
+            <div><div class="metric-label">Exception documentation</div><div class="h4">{{ metrics.exception_documentation_rate|percent }}</div></div>
+          </div>
+          {% if metrics.reconciliation_errors %}<div class="alert alert-danger mt-3 mb-0">Reconciliation errors: {{ metrics.reconciliation_errors|prettyjson }}</div>{% endif %}
+        {% else %}
+          <p class="text-muted mb-0">No matching scorecard yet{% if latest_run %} — validate the latest run to calculate metrics{% endif %}.</p>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+</div>
+
+{% if user|can_run_actions %}
+<section class="card mt-4">
+  <div class="card-header"><h2 class="h5 mb-0">Workflow actions</h2></div>
+  <div class="card-body">
+    <form method="post" action="{% url 'dashboard:action_run_scheduler' %}" class="row g-2 align-items-end mb-3">
+      {% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}">
+      <div class="col-sm-4 col-lg-3"><label class="form-label" for="seed">Optional deterministic seed</label><input id="seed" class="form-control" type="number" name="seed" placeholder="20261022"></div>
+      <div class="col-sm-5 col-lg-4"><button class="btn btn-primary" type="submit">Run scheduler</button></div>
+    </form>
+    <div class="row g-2">
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_validate_data' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-primary w-100" type="submit">Validate data</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_validate_schedule' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-primary w-100" type="submit">Validate schedule</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_inject_anomalies' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-warning w-100" type="submit">Inject anomalies</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_detect_violations' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-warning w-100" type="submit">Detect violations</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_evaluate_anomalies' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-warning w-100" type="submit">Evaluate anomalies</button></form></div>
+      <div class="col-md-6 col-xl-3"><form method="post" action="{% url 'dashboard:action_export_data' %}">{% csrf_token %}<input type="hidden" name="next" value="{{ request.path }}"><button class="btn btn-outline-secondary w-100" type="submit">Export data</button></form></div>
+    </div>
+    <p class="small text-muted mt-3 mb-0">Actions run synchronously and record results through the same services used by management commands.</p>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

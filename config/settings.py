@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 
+from django.contrib.messages import constants as message_constants
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Development key. Override with an environment variable in any real deployment.
@@ -72,8 +74,23 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-LOGIN_URL = "/admin/login/"
+LOGIN_URL = "/accounts/login/"
 LOGIN_REDIRECT_URL = "/"
+LOGOUT_REDIRECT_URL = "/"
+
+MESSAGE_TAGS = {
+    message_constants.DEBUG: "secondary",
+    message_constants.INFO: "info",
+    message_constants.SUCCESS: "success",
+    message_constants.WARNING: "warning",
+    message_constants.ERROR: "danger",
+}
+
+ROLE_LEARNER = "Learner"
+ROLE_INSTRUCTOR = "Instructor"
+ROLE_ADMINISTRATOR = "Academic Administrator"
+ROLE_SUPPORT = "Support Staff"
+ROLE_PLATFORM_ADMIN = "Platform Administrator"
 
 LOGGING = {
     "version": 1,

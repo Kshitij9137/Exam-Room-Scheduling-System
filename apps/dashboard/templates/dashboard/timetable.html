@@ -1,0 +1,53 @@
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}Timetable · Exam Scheduler{% endblock %}
+{% block page_title %}Timetable{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+  <span class="badge text-bg-primary">{{ run.run_id }}</span>
+  <span class="badge text-bg-secondary">{{ run.run_type }}</span>
+  <span class="text-muted small">{{ run.status }} · {{ run.started_at|date:"Y-m-d H:i" }}</span>
+</div>
+<section class="card mb-4">
+  <div class="card-body">
+    <form method="get" class="row g-3">
+      {% for field in form %}
+        <div class="col-md-4 col-xl-2">
+          <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+          {{ field }}
+          {% for error in field.errors %}<div class="invalid-feedback d-block">{{ error }}</div>{% endfor %}
+        </div>
+      {% endfor %}
+      <div class="col-12 d-flex gap-2">
+        <button class="btn btn-primary" type="submit">Apply filters</button>
+        <a class="btn btn-outline-secondary" href="{% url 'dashboard:timetable' %}">Clear</a>
+      </div>
+    </form>
+  </div>
+</section>
+{% if grouped %}
+  {% for date, assignments in grouped.items %}
+  <section class="card mb-4">
+    <div class="card-header d-flex justify-content-between"><h2 class="h5 mb-0">{{ date|date:"l, F j, Y" }}</h2><span class="badge text-bg-light">{{ assignments|length }} room assignments</span></div>
+    <div class="table-responsive">
+      <table class="table table-hover align-middle mb-0">
+        <thead><tr><th>Time</th><th>Exam / course</th><th>Room</th><th>Students</th><th>Invigilators</th></tr></thead>
+        <tbody>
+          {% for assignment in assignments %}
+          <tr>
+            <td class="text-nowrap">{{ assignment.start_at|date:"H:i" }}–{{ assignment.end_at|date:"H:i" }}</td>
+            <td><a href="{% url 'dashboard:exam_detail' assignment.exam_id %}">{{ assignment.exam_id }}</a><div class="small text-muted">{{ assignment.exam.course.course_code }} · {{ assignment.exam.course.title }}</div></td>
+            <td>{{ assignment.room.room_id }}<div class="small text-muted">{{ assignment.room.building }} {{ assignment.room.room_number }}</div></td>
+            <td>{{ assignment.allocated_count }}</td>
+            <td>{% for item in assignment.invigilator_assignments.all %}<span class="d-block">{{ item.invigilator.full_name }}</span>{% empty %}<span class="text-muted">—</span>{% endfor %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endfor %}
+{% else %}
+  <div class="alert alert-info">{% if has_filter %}No assignments match these filters.{% else %}This run has no assigned exams.{% endif %}</div>
+{% endif %}
+{% endblock %}

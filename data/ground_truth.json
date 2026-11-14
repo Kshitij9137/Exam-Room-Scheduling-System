@@ -43,7 +43,7 @@
     "anomaly_id": "EDGE-004",
     "issue_type": "ACCOMMODATION_BREACH",
     "assignment_id": "ASN-EXAM-2026-000003-ROOM-000001-RUN-000002",
-    "affected_entity_id": "STU-000017",
+    "affected_entity_id": "STU-000047",
     "expected_violation_code": "ACCOMMODATION_VIOLATION",
     "run_id": "RUN-000002"
   },

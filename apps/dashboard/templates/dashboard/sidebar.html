@@ -1,0 +1,14 @@
+{% load dashboard_tags %}
+<nav class="sidebar py-4" aria-label="Main navigation">
+  <div class="px-3 text-uppercase sidebar-heading">Workspace</div>
+  <a class="sidebar-link" href="{% url 'dashboard:home' %}">Overview</a>
+  <a class="sidebar-link" href="{% url 'dashboard:timetable' %}">Timetable</a>
+  <a class="sidebar-link" href="{% url 'dashboard:student_lookup' %}">Student lookup</a>
+  <a class="sidebar-link" href="{% url 'dashboard:exceptions' %}">Exceptions</a>
+  <a class="sidebar-link" href="{% url 'dashboard:validation' %}">Validation</a>
+  <a class="sidebar-link" href="{% url 'dashboard:conflict_graph' %}">Conflict graph</a>
+  {% if user|can_run_actions %}
+    <div class="px-3 mt-4 text-uppercase sidebar-heading">Administration</div>
+    <a class="sidebar-link" href="/admin/">Django admin</a>
+  {% endif %}
+</nav>

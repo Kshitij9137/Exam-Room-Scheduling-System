@@ -1,0 +1,12 @@
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}Exceptions · Exam Scheduler{% endblock %}
+{% block page_title %}Exceptions centre{% endblock %}
+{% block content %}
+<div class="d-flex gap-2 align-items-center mb-3"><span class="badge text-bg-primary">{{ run.run_id }}</span><span class="badge text-bg-secondary">{{ run.run_type }}</span><span class="text-muted">{{ rows|length }} unassigned exams</span></div>
+{% if rows %}
+<div class="card"><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Exam</th><th>Course</th><th>Primary reason</th><th>Evidence</th></tr></thead><tbody>
+{% for row in rows %}<tr><td><a href="{% url 'dashboard:exam_detail' row.exam_id %}">{{ row.exam_id }}</a></td><td>{{ row.exam.course.course_code }} — {{ row.exam.course.title }}</td><td><span class="badge text-bg-warning">{{ row.get_primary_reason_code_display }}</span></td><td><details><summary>View evidence</summary><pre class="small mt-2 mb-0">{{ row.evidence|prettyjson }}</pre></details></td></tr>{% endfor %}
+</tbody></table></div></div>
+{% else %}<div class="alert alert-success">No unassigned exams in this run.</div>{% endif %}
+{% endblock %}

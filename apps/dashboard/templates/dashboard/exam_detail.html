@@ -1,0 +1,53 @@
+{% extends "dashboard/base.html" %}
+{% load dashboard_tags %}
+{% block title %}{{ exam.exam_id }} · Exam Scheduler{% endblock %}
+{% block page_title %}Exam detail{% endblock %}
+{% block content %}
+<div class="card mb-4">
+  <div class="card-body">
+    <div class="d-flex flex-wrap justify-content-between gap-3">
+      <div><div class="text-muted">{{ exam.exam_id }} · {{ exam.term }}</div><h2 class="h3">{{ exam.title }}</h2><p class="mb-1">{{ exam.course.course_code }} — {{ exam.course.title }}</p><p class="text-muted mb-0">{{ exam.course.get_department_display }} · {{ exam.duration_minutes }} minutes</p></div>
+      <div class="text-end"><span class="badge text-bg-secondary">{{ exam.get_status_display }}</span>{% if run %}<div class="small text-muted mt-2">Run {{ run.run_id }}</div>{% endif %}</div>
+    </div>
+    <hr>
+    <div class="row">
+      <div class="col-md-4"><div class="metric-label">Active enrollments</div><div class="h4">{{ active_enrollments }}</div></div>
+      <div class="col-md-8"><div class="metric-label">Required equipment</div>{% for equipment in required_equipment %}<span class="badge text-bg-light me-1">{{ equipment }}</span>{% empty %}<span class="text-muted">No special equipment</span>{% endfor %}</div>
+    </div>
+  </div>
+</div>
+
+<section class="card mb-4">
+  <div class="card-header"><h2 class="h5 mb-0">Why this assignment?</h2></div>
+  <div class="card-body">
+    {% if events %}
+      {% for event in events %}<div class="border-start border-3 ps-3 mb-3"><strong>{{ event.get_event_type_display }}</strong><div class="small text-muted">{{ event.event_at|date:"Y-m-d H:i:s" }}</div><pre class="small mb-0 mt-2">{{ event.detail|prettyjson }}</pre></div>{% endfor %}
+    {% else %}
+      <p class="text-muted mb-0">No explanation events are recorded for this exam in the latest completed run.</p>
+    {% endif %}
+  </div>
+</section>
+
+{% if assignments %}
+<section class="card mb-4">
+  <div class="card-header"><h2 class="h5 mb-0">Assignments</h2></div>
+  <div class="table-responsive">
+    <table class="table align-middle mb-0"><thead><tr><th>Time</th><th>Room</th><th>Students</th><th>Invigilators</th></tr></thead>
+      <tbody>{% for assignment in assignments %}
+        <tr><td>{{ assignment.start_at|date:"Y-m-d H:i" }}–{{ assignment.end_at|date:"H:i" }}</td><td>{{ assignment.room.room_id }} · {{ assignment.room.building }} {{ assignment.room.room_number }}</td><td>{{ assignment.allocated_count }}</td><td>{% for item in assignment.invigilator_assignments.all %}<div>{{ item.invigilator.full_name }} <span class="text-muted small">{{ item.get_role_display }}</span></div>{% empty %}—{% endfor %}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+  </div>
+</section>
+{% if accommodations %}
+<section class="card mb-4"><div class="card-header"><h2 class="h5 mb-0">Accommodations in this exam</h2></div><ul class="list-group list-group-flush">{% for accommodation in accommodations %}<li class="list-group-item">{{ accommodation.student.student_id }} · {{ accommodation.student.full_name }} — {{ accommodation.get_accommodation_type_display }}{% if accommodation.extra_time_percent %} (+{{ accommodation.extra_time_percent }}% time){% endif %}</li>{% endfor %}</ul></section>
+{% endif %}
+{% if assigned_students %}
+<details class="card mb-4"><summary class="card-header">Assigned students ({{ assigned_students|length }})</summary><div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Student</th><th>Name</th><th>Room</th><th>Required minutes</th></tr></thead><tbody>{% for row in assigned_students %}<tr><td>{{ row.student_id }}</td><td>{{ row.student.full_name }}</td><td>{{ row.assignment.room_id }}</td><td>{{ row.required_minutes }}</td></tr>{% endfor %}</tbody></table></div></details>
+{% endif %}
+{% elif unassigned %}
+<div class="alert alert-warning"><h2 class="h5">Exam unassigned</h2><p><strong>{{ unassigned.get_primary_reason_code_display }}</strong></p><pre class="small mb-0">{{ unassigned.evidence|prettyjson }}</pre></div>
+{% else %}
+<div class="alert alert-info">No assignment record exists for this exam in the latest completed run.</div>
+{% endif %}
+{% endblock %}

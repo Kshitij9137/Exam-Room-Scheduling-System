@@ -1,0 +1,44 @@
+{
+  "validation_id": "VAL-000002",
+  "scheduler_run": "RUN-000003",
+  "ground_truth_count": 7,
+  "detected_count": 7,
+  "tp": 7,
+  "fp": 0,
+  "fn": 0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "true_positives": [
+    [
+      "ASN-EXAM-2026-000001-ROOM-000005-RUN-000003",
+      "STUDENT_DOUBLE_BOOKING"
+    ],
+    [
+      "ASN-EXAM-2026-000002-ROOM-000097-RUN-000003",
+      "STUDENT_DOUBLE_BOOKING"
+    ],
+    [
+      "ASN-EXAM-2026-000003-ROOM-000005-RUN-000003",
+      "ROOM_CAPACITY_EXCEEDED"
+    ],
+    [
+      "ASN-EXAM-2026-000006-ROOM-000003-RUN-000003",
+      "INVIGILATOR_DOUBLE_BOOKED"
+    ],
+    [
+      "ASN-EXAM-2026-000007-ROOM-000075-RUN-000003",
+      "INVIGILATOR_DOUBLE_BOOKED"
+    ],
+    [
+      "ASN-EXAM-2026-000013-ROOM-000070-RUN-000003",
+      "ACCOMMODATION_VIOLATION"
+    ],
+    [
+      "ASN-EXAM-2026-000014-ROOM-000057-RUN-000003",
+      "ROOM_UNAVAILABLE_VIOLATION"
+    ]
+  ],
+  "false_positives": [],
+  "false_negatives": []
+}

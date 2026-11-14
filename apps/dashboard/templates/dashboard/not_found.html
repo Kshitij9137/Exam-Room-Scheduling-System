@@ -1,0 +1,7 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Not found · Exam Scheduler{% endblock %}
+{% block page_title %}No record found{% endblock %}
+{% block content %}
+<div class="alert alert-warning">No record found for {{ what }}.</div>
+<a href="{% url 'dashboard:home' %}" class="btn btn-outline-primary">Back to overview</a>
+{% endblock %}

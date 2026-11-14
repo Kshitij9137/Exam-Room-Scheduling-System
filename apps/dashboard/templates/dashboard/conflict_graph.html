@@ -1,0 +1,43 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Conflict graph · Exam Scheduler{% endblock %}
+{% block page_title %}Conflict graph{% endblock %}
+{% block extra_head %}<link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet">{% endblock %}
+{% block content %}
+<div class="card"><div class="card-body"><p class="text-muted">Term {{ term }} · Edges connect exams with shared students; edge weight is the number of shared students. Displaying up to 30 exams with the highest conflict degree.</p>
+  {% if nodes %}<div id="conflict-network" class="graph-canvas" role="img" aria-label="Interactive exam conflict network"></div>
+  {% else %}<div class="alert alert-info mb-0">No exams are available to build the conflict graph.</div>{% endif %}
+</div></div>
+{{ nodes|json_script:"conflict-nodes" }}
+{{ edges|json_script:"conflict-edges" }}
+{% endblock %}
+{% block extra_js %}
+{% if nodes %}
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script>
+  (() => {
+    const nodes = JSON.parse(document.getElementById("conflict-nodes").textContent);
+    const edges = JSON.parse(document.getElementById("conflict-edges").textContent);
+    const graphNodes = nodes.map((node) => ({
+      id: node.id,
+      label: `${node.label}\n${node.course} · degree ${node.degree}`,
+      title: `${node.course} · ${node.enrollment} enrolled${node.slot ? ` · ${node.slot}` : ""}`,
+      value: Math.max(1, node.degree)
+    }));
+    const graphEdges = edges.map((edge) => ({
+      from: edge.from,
+      to: edge.to,
+      value: edge.value,
+      title: `${edge.value} shared student(s)`
+    }));
+    const network = new vis.Network(
+      document.getElementById("conflict-network"),
+      {nodes: new vis.DataSet(graphNodes), edges: new vis.DataSet(graphEdges)},
+      {nodes: {shape: "dot", scaling: {min: 10, max: 30}}, edges: {smooth: true}, physics: {stabilization: true}, interaction: {hover: true}}
+    );
+    network.on("doubleClick", ({nodes: selected}) => {
+      if (selected.length) window.location.href = `/exams/${encodeURIComponent(selected[0])}/`;
+    });
+  })();
+</script>
+{% endif %}
+{% endblock %}

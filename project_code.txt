@@ -2995,7 +2995,7 @@ FILE: README.md
 ======================================================================
 # Exam & Room Scheduling System
 
-Django + SQLite + Bootstrap. Status: **Phase 3 complete** (schema, deterministic synthetic data, validation, exports, and reproducibility checks).
+Django + SQLite + Bootstrap. Status: **Phases 3–5 implemented**.
 
 ## Setup
 ```bash
@@ -3006,17 +3006,29 @@ python manage.py migrate
 python manage.py createsuperuser
 python manage.py generate_data --seed 20261022 --scale starter
 python manage.py validate_data
-python manage.py export_data
 python manage.py verify_reproducibility --seed 20261022 --scale starter
+python manage.py run_scheduler --seed 20261022
+python manage.py validate_schedule
+python manage.py inject_anomalies
+python manage.py detect_violations
+python manage.py evaluate_anomalies
+python manage.py export_data
 python manage.py runserver      # http://127.0.0.1:8000  and /admin/
 python manage.py test           # all tests
 ```
 See `docs/` for architecture, business rules, ER diagram and data dictionary.
 
 Use `--scale full` to generate the required 5,000-student dataset. To replace
-existing generated data before a scheduling history exists, add `--force`.
+existing generated data before scheduling history exists, add `--force`.
 Exports are written under `data/exports/`; generation metadata, validation and
-reproducibility summaries are written under `data/`.
+reproducibility summaries are written under `data/`. The scheduler creates a
+new run and retains its assignment history; exams that cannot satisfy all hard
+constraints are reported with reason codes and evidence. Schedule validation
+writes `data/validation_scorecard.json`. The anomaly commands create a separate
+fixture run, write run-scoped ground truth to `data/ground_truth.csv` and
+`data/ground_truth.json`, and report evaluation metrics to
+`data/anomaly_evaluation.json`. Room closures attached to an anomaly fixture
+are scoped to that run and do not affect baseline schedules.
 
 ======================================================================
 FILE: requirements.txt
@@ -4534,6 +4546,13 @@ class RoomClosure(models.Model):
 
     closure_id = models.CharField(primary_key=True, max_length=10, validators=[id_validator("closure")])
     room = models.ForeignKey(Room, on_delete=models.PROTECT, related_name="closures")
+    run = models.ForeignKey(
+        "SchedulerRun",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="room_closures",
+    )
     start_at = models.DateTimeField()
     end_at = models.DateTimeField()
     reason = models.CharField(max_length=12, choices=Reason.choices)
@@ -4785,6 +4804,60 @@ FILE: apps\scheduling\__init__.py
 ======================================================================
 
 ======================================================================
+FILE: apps\scheduling\management\__init__.py
+======================================================================
+
+======================================================================
+FILE: apps\scheduling\management\commands\run_scheduler.py
+======================================================================
+from django.core.management.base import BaseCommand, CommandError
+
+from apps.scheduling.models import (
+    ScheduleAssignment,
+    SchedulerRun,
+    UnassignedExam,
+)
+from apps.scheduling.services.scheduler import run_scheduler
+
+
+class Command(BaseCommand):
+    help = "Schedule exams and persist a new, traceable SchedulerRun."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--seed", type=int)
+        parser.add_argument(
+            "--run-type",
+            choices=[choice.value for choice in SchedulerRun.RunType],
+            default=SchedulerRun.RunType.BASELINE,
+        )
+        parser.add_argument(
+            "--no-reset",
+            action="store_true",
+            help="Schedule only exams currently in PLANNED status.",
+        )
+
+    def handle(self, *args, **options):
+        run = run_scheduler(
+            seed=options["seed"],
+            run_type=options["run_type"],
+            reset_exams=not options["no_reset"],
+        )
+        assignment_count = ScheduleAssignment.objects.filter(run=run).count()
+        unassigned_count = UnassignedExam.objects.filter(run=run).count()
+        output = (
+            f"{run.run_id}: {assignment_count} room assignments, "
+            f"{unassigned_count} unassigned "
+            f"({run.notes})"
+        )
+        if run.status != SchedulerRun.Status.COMPLETED:
+            raise CommandError(f"Scheduling run failed: {output}")
+        self.stdout.write(self.style.SUCCESS(output))
+
+======================================================================
+FILE: apps\scheduling\management\commands\__init__.py
+======================================================================
+
+======================================================================
 FILE: apps\scheduling\migrations\0001_initial.py
 ======================================================================
 # Generated by Django 5.2.19 on 2026-11-14 09:18
@@ -4980,7 +5053,1361 @@ class Migration(migrations.Migration):
     ]
 
 ======================================================================
+FILE: apps\scheduling\migrations\0002_roomclosure_run.py
+======================================================================
+# Generated by Django 5.2.19 on 2026-11-14 11:30
+
+import django.db.models.deletion
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('scheduling', '0001_initial'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='roomclosure',
+            name='run',
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.CASCADE, related_name='room_closures', to='scheduling.schedulerrun'),
+        ),
+    ]
+
+======================================================================
 FILE: apps\scheduling\migrations\__init__.py
+======================================================================
+
+======================================================================
+FILE: apps\scheduling\services\accommodation.py
+======================================================================
+"""Resolve effective student accommodations for an exam date."""
+
+from django.db.models import Q
+
+from apps.core.models import Accommodation
+
+
+def accommodations_active_on(student_id, on_date):
+    return list(
+        Accommodation.objects.filter(
+            student_id=student_id,
+            status=Accommodation.Status.ACTIVE,
+            effective_from__lte=on_date,
+        )
+        .filter(Q(effective_to__isnull=True) | Q(effective_to__gte=on_date))
+        .order_by("accommodation_id")
+    )
+
+
+def active_accommodations(accommodations, on_date):
+    """Filter preloaded accommodations without issuing per-student queries."""
+    return [
+        accommodation
+        for accommodation in accommodations
+        if accommodation.status == Accommodation.Status.ACTIVE
+        and accommodation.effective_from <= on_date
+        and (
+            accommodation.effective_to is None
+            or accommodation.effective_to >= on_date
+        )
+    ]
+
+
+def required_minutes(base_minutes, accommodations):
+    extra_time_percent = max(
+        (
+            accommodation.extra_time_percent
+            for accommodation in accommodations
+            if accommodation.accommodation_type == Accommodation.Type.EXTRA_TIME
+        ),
+        default=0,
+    )
+    return (base_minutes * (100 + extra_time_percent) + 99) // 100
+
+
+def needs_separate_room(accommodations):
+    return any(
+        accommodation.accommodation_type == Accommodation.Type.SEPARATE_ROOM
+        for accommodation in accommodations
+    )
+
+
+def needs_accessible_room(accommodations):
+    return any(
+        accommodation.accommodation_type == Accommodation.Type.ACCESSIBLE_ROOM
+        for accommodation in accommodations
+    )
+
+======================================================================
+FILE: apps\scheduling\services\conflict_graph.py
+======================================================================
+"""Build a weighted exam-conflict graph from active term enrollments."""
+
+from collections import defaultdict
+
+from django.conf import settings
+
+from apps.core.models import Enrollment
+
+
+class ConflictGraph:
+    """Exam vertices; edge weights count students enrolled in both exams."""
+
+    def __init__(self, exams=()):
+        self.exams = list(exams)
+        self.adj = {exam.exam_id: {} for exam in self.exams}
+        self.degree = {exam.exam_id: 0 for exam in self.exams}
+
+    def add_edge(self, first, second, weight=1):
+        if first == second:
+            return
+        self.adj.setdefault(first, {})
+        self.adj.setdefault(second, {})
+        self.adj[first][second] = self.adj[first].get(second, 0) + weight
+        self.adj[second][first] = self.adj[second].get(first, 0) + weight
+        self.degree[first] = len(self.adj[first])
+        self.degree[second] = len(self.adj[second])
+
+    def neighbors(self, exam_id):
+        return self.adj.get(exam_id, {})
+
+    def edge_weight(self, first, second):
+        return self.adj.get(first, {}).get(second, 0)
+
+
+def build_conflict_graph(exams, term=None):
+    """Return the graph and active student IDs grouped by exam ID."""
+    term = term or settings.SCHEDULER_POLICY["TERM"]
+    graph = ConflictGraph(exams)
+    exam_by_course = {exam.course_id: exam.exam_id for exam in graph.exams}
+    students_by_exam = {exam.exam_id: set() for exam in graph.exams}
+    exams_by_student = defaultdict(set)
+
+    enrollments = (
+        Enrollment.objects.filter(
+            status=Enrollment.Status.ACTIVE,
+            term=term,
+            course_id__in=exam_by_course,
+        )
+        .order_by("student_id", "course_id")
+        .values_list("student_id", "course_id")
+        .iterator()
+    )
+    for student_id, course_id in enrollments:
+        exam_id = exam_by_course[course_id]
+        students_by_exam[exam_id].add(student_id)
+        exams_by_student[student_id].add(exam_id)
+
+    for exam_ids in exams_by_student.values():
+        ordered_ids = sorted(exam_ids)
+        for index, first in enumerate(ordered_ids):
+            for second in ordered_ids[index + 1:]:
+                graph.add_edge(first, second)
+
+    return graph, students_by_exam
+
+======================================================================
+FILE: apps\scheduling\services\context.py
+======================================================================
+"""Preloaded, per-run in-memory scheduling state."""
+
+from collections import defaultdict
+
+from django.db.models import Q
+
+from apps.core.models import (
+    Accommodation,
+    Exam,
+    ExamRequirement,
+    ExamRequirementEquipment,
+    Invigilator,
+    Room,
+    RoomCapacity,
+    RoomEquipment,
+    Student,
+)
+from apps.core.services.id_generator import make_id
+from apps.scheduling.models import (
+    Availability,
+    InvigilatorAssignment,
+    RoomClosure,
+    ScheduleEvent,
+    StudentRoomAllocation,
+    TimeSlot,
+    UnassignedExam,
+)
+
+
+def _next_counter(model, field_name):
+    last_value = (
+        model.objects.order_by(f"-{field_name}")
+        .values_list(field_name, flat=True)
+        .first()
+    )
+    if not last_value:
+        return 0
+    try:
+        return int(last_value.rsplit("-", 1)[-1])
+    except ValueError as error:
+        raise ValueError(f"Invalid {field_name} value in {model._meta.label}.") from error
+
+
+class SchedulingContext:
+    def __init__(
+        self,
+        *,
+        run,
+        term,
+        exams,
+        graph,
+        students_by_exam,
+        invigilators=(),
+        capacities=None,
+        invigilator_avails=None,
+        exam_requirements=None,
+        policy=None,
+        rooms=(),
+        room_equipment=None,
+        exam_equipment=None,
+        room_avails=None,
+        room_closures=None,
+        slots=(),
+        accommodations=None,
+    ):
+        self.run = run
+        self.term = term
+        self.exams = list(exams)
+        self.graph = graph
+        self.students_by_exam = students_by_exam
+        self.invigilators = list(invigilators)
+        self.capacities = capacities or {}
+        self.invigilator_avails = invigilator_avails or {}
+        self.exam_requirements = exam_requirements or {}
+        self.policy = policy or {}
+        self.rooms = list(rooms)
+        self.room_equipment = room_equipment or {}
+        self.exam_equipment = exam_equipment or {}
+        self.room_avails = room_avails or {}
+        self.room_closures = room_closures or {}
+        self.slots = list(slots)
+        self.accommodations = accommodations or {}
+        self.students = {}
+
+        self.room_bookings = defaultdict(list)
+        self.invigilator_bookings = defaultdict(list)
+        self.student_intervals = defaultdict(list)
+        self.exam_slots = {}
+        self.time_groups = {}
+        self.last_room_evidence = {}
+
+        self._sra_counter = _next_counter(
+            StudentRoomAllocation, "allocation_id"
+        )
+        self._ias_counter = _next_counter(InvigilatorAssignment, "ias_id")
+        self._evt_counter = _next_counter(ScheduleEvent, "event_id")
+        self._una_counter = _next_counter(UnassignedExam, "unassigned_id")
+
+    def next_sra(self):
+        self._sra_counter += 1
+        return make_id("student_allocation", self._sra_counter)
+
+    def next_ias(self):
+        self._ias_counter += 1
+        return make_id("invigilator_assignment", self._ias_counter)
+
+    def next_evt(self):
+        self._evt_counter += 1
+        return make_id("event", self._evt_counter)
+
+    def next_una(self):
+        self._una_counter += 1
+        return make_id("unassigned", self._una_counter)
+
+    def capacity(self, room, on_date):
+        effective = [
+            (effective_from, capacity)
+            for effective_from, effective_to, capacity
+            in self.capacities.get(room.room_id, ())
+            if effective_from <= on_date
+            and (effective_to is None or effective_to >= on_date)
+        ]
+        return max(effective, default=(None, 0))[1]
+
+def build_context(run, term, policy):
+    exams = list(
+        Exam.objects.filter(term=term)
+        .select_related("course")
+        .order_by("exam_id")
+    )
+    from apps.scheduling.services.conflict_graph import build_conflict_graph
+
+    graph, students_by_exam = build_conflict_graph(exams, term=term)
+
+    capacities = defaultdict(list)
+    for capacity in RoomCapacity.objects.order_by("room_id", "effective_from"):
+        capacities[capacity.room_id].append(
+            (
+                capacity.effective_from,
+                capacity.effective_to,
+                capacity.exam_capacity,
+            )
+        )
+
+    invigilator_avails = defaultdict(list)
+    room_avails = defaultdict(list)
+    for availability in Availability.objects.order_by("availability_id"):
+        interval = (availability.start_at, availability.end_at)
+        if availability.invigilator_id:
+            invigilator_avails[availability.invigilator_id].append(interval)
+        elif availability.room_id:
+            room_avails[availability.room_id].append(interval)
+
+    room_closures = defaultdict(list)
+    for closure in RoomClosure.objects.filter(
+        Q(run__isnull=True) | Q(run=run)
+    ).order_by("closure_id"):
+        room_closures[closure.room_id].append(
+            (closure.start_at, closure.end_at)
+        )
+
+    room_equipment = defaultdict(set)
+    for room_id, equipment_id in RoomEquipment.objects.order_by(
+        "room_id", "equipment_id"
+    ).values_list("room_id", "equipment_id"):
+        room_equipment[room_id].add(equipment_id)
+
+    requirements = {
+        requirement.exam_id: requirement
+        for requirement in ExamRequirement.objects.order_by("requirement_id")
+    }
+    requirement_equipment = defaultdict(set)
+    for requirement_id, equipment_id in ExamRequirementEquipment.objects.values_list(
+        "requirement_id", "equipment_id"
+    ):
+        requirement_equipment[requirement_id].add(equipment_id)
+    exam_equipment = {
+        exam_id: requirement_equipment[requirement.requirement_id]
+        for exam_id, requirement in requirements.items()
+    }
+    active_student_ids = {
+        student_id
+        for student_ids in students_by_exam.values()
+        for student_id in student_ids
+    }
+
+    accommodations = defaultdict(list)
+    for accommodation in Accommodation.objects.filter(
+        status=Accommodation.Status.ACTIVE
+    ).order_by("accommodation_id"):
+        accommodations[accommodation.student_id].append(accommodation)
+
+    context = SchedulingContext(
+        run=run,
+        term=term,
+        exams=exams,
+        graph=graph,
+        students_by_exam=students_by_exam,
+        invigilators=Invigilator.objects.filter(
+            status=Invigilator.Status.ACTIVE
+        ).order_by("invigilator_id"),
+        capacities=capacities,
+        invigilator_avails=invigilator_avails,
+        exam_requirements=requirements,
+        policy=policy,
+        rooms=Room.objects.filter(status=Room.Status.ACTIVE).order_by("room_id"),
+        room_equipment=room_equipment,
+        exam_equipment=exam_equipment,
+        room_avails=room_avails,
+        room_closures=room_closures,
+        slots=TimeSlot.objects.order_by("slot_date", "start_time", "slot_id"),
+        accommodations=accommodations,
+    )
+    context.students = Student.objects.in_bulk(active_student_ids)
+    return context
+
+======================================================================
+FILE: apps\scheduling\services\explanations.py
+======================================================================
+"""Persist explainable schedule and unassignment events."""
+
+from apps.scheduling.models import ScheduleEvent
+
+
+def record_event(context, exam, event_type, detail, assignment=None):
+    return ScheduleEvent.objects.create(
+        event_id=context.next_evt(),
+        run=context.run,
+        exam=exam,
+        assignment=assignment,
+        event_type=event_type,
+        detail=detail or {},
+    )
+
+
+def explain_unassigned(exam_id, reason, evidence):
+    return {
+        "exam_id": exam_id,
+        "primary_reason": reason,
+        "evidence": evidence,
+    }
+
+======================================================================
+FILE: apps\scheduling\services\invigilator_allocator.py
+======================================================================
+"""Allocate available invigilators without overlaps or daily-hour violations."""
+
+import math
+
+from apps.scheduling.models import UnassignedExam
+from apps.scheduling.services.slot_allocator import buffered_overlap
+
+
+def _available(invigilator, start_at, end_at, context):
+    return any(
+        window_start <= start_at and window_end >= end_at
+        for window_start, window_end in context.invigilator_avails.get(
+            invigilator.invigilator_id, ()
+        )
+    )
+
+
+def _free(invigilator, start_at, end_at, context):
+    return not any(
+        buffered_overlap(
+            start_at,
+            end_at,
+            booked_start,
+            booked_end,
+            context.policy.get("HARD_BUFFER_MINUTES", 0),
+        )
+        for booked_start, booked_end in context.invigilator_bookings.get(
+            invigilator.invigilator_id, ()
+        )
+    )
+
+
+def _within_daily_limit(invigilator, start_at, end_at, context):
+    assigned_minutes = sum(
+        (booked_end - booked_start).total_seconds() / 60
+        for booked_start, booked_end in context.invigilator_bookings.get(
+            invigilator.invigilator_id, ()
+        )
+        if booked_start.date() == start_at.date()
+    )
+    required_minutes = (end_at - start_at).total_seconds() / 60
+    return (
+        assigned_minutes + required_minutes
+        <= float(invigilator.max_daily_hours) * 60
+    )
+
+
+def _within_consecutive_limit(invigilator, start_at, end_at, context):
+    limit_hours = context.policy.get("MAX_CONSECUTIVE_INVIGILATOR_HOURS")
+    if limit_hours is None:
+        return True
+
+    intervals = sorted(
+        [
+            *context.invigilator_bookings.get(
+                invigilator.invigilator_id, ()
+            ),
+            (start_at, end_at),
+        ]
+    )
+    chain_start, chain_end = intervals[0]
+    limit_minutes = float(limit_hours) * 60
+    for next_start, next_end in intervals[1:]:
+        if next_start > chain_end:
+            chain_start, chain_end = next_start, next_end
+        else:
+            chain_end = max(chain_end, next_end)
+        if (chain_end - chain_start).total_seconds() / 60 > limit_minutes:
+            return False
+    return (chain_end - chain_start).total_seconds() / 60 <= limit_minutes
+
+
+def allocate_invigilators(context, exam, room_allocations, start_at, end_at):
+    """Return per-room staff assignments or a ``NO_INVIGILATOR`` reason."""
+    requirement = context.exam_requirements.get(exam.exam_id)
+    ratio = requirement.invigilator_ratio if requirement else 50
+    used_ids = set()
+    result = []
+
+    workloads = getattr(context, "invigilator_workload_minutes", {})
+    for room, students in room_allocations:
+        needed = max(1, math.ceil(len(students) / ratio))
+        eligible = [
+            invigilator
+            for invigilator in context.invigilators
+            if invigilator.invigilator_id not in used_ids
+            and _available(invigilator, start_at, end_at, context)
+            and _free(invigilator, start_at, end_at, context)
+            and _within_daily_limit(
+                invigilator, start_at, end_at, context
+            )
+            and _within_consecutive_limit(
+                invigilator, start_at, end_at, context
+            )
+        ]
+        eligible.sort(
+            key=lambda invigilator: (
+                workloads.get(invigilator.invigilator_id, 0),
+                invigilator.invigilator_id,
+            )
+        )
+        selected = eligible[:needed]
+        if len(selected) != needed:
+            return None, UnassignedExam.Reason.NO_INVIGILATOR
+        used_ids.update(inv.invigilator_id for inv in selected)
+        result.append((room, selected))
+
+    return result, None
+
+======================================================================
+FILE: apps\scheduling\services\room_allocator.py
+======================================================================
+"""Best-fit room allocation with capacity, equipment, and availability checks."""
+
+from apps.scheduling.services.accommodation import (
+    needs_accessible_room,
+    needs_separate_room,
+)
+from apps.scheduling.services.slot_allocator import buffered_overlap, overlap
+from apps.scheduling.models import UnassignedExam
+
+
+def _rooms_for_interval(ctx, exam, start_at, end_at):
+    on_date = start_at.date()
+    equipment_needed = getattr(ctx, "exam_equipment", {}).get(exam.exam_id, set())
+    available = []
+    rejected = {
+        "inactive_or_missing_capacity": 0,
+        "missing_equipment": 0,
+        "unavailable_or_closed": 0,
+        "already_booked": 0,
+    }
+
+    for room in ctx.rooms:
+        capacity = ctx.capacity(room, on_date)
+        if capacity <= 0:
+            rejected["inactive_or_missing_capacity"] += 1
+            continue
+        if not equipment_needed.issubset(
+            ctx.room_equipment.get(room.room_id, set())
+        ):
+            rejected["missing_equipment"] += 1
+            continue
+        if not any(
+            window_start <= start_at and window_end >= end_at
+            for window_start, window_end in ctx.room_avails.get(
+                room.room_id, ()
+            )
+        ):
+            rejected["unavailable_or_closed"] += 1
+            continue
+        if any(
+            overlap(start_at, end_at, closure_start, closure_end)
+            for closure_start, closure_end in ctx.room_closures.get(
+                room.room_id, ()
+            )
+        ):
+            rejected["unavailable_or_closed"] += 1
+            continue
+        if any(
+            buffered_overlap(
+                start_at,
+                end_at,
+                booked_start,
+                booked_end,
+                ctx.policy.get("HARD_BUFFER_MINUTES", 0),
+            )
+            for booked_start, booked_end in ctx.room_bookings.get(
+                room.room_id, ()
+            )
+        ):
+            rejected["already_booked"] += 1
+            continue
+        available.append((room, capacity))
+
+    return available, rejected
+
+
+def _place_group(
+    ctx,
+    students,
+    candidate_rooms,
+    allocations,
+    *,
+    separate,
+    allow_multi_room,
+    require_accessible,
+):
+    """Place a group in best-fit rooms; return False without partial side effects."""
+    remaining = list(students)
+    if not remaining:
+        return True
+
+    candidates = sorted(
+        candidate_rooms,
+        key=lambda item: (item[1], item[0].room_id),
+    )
+    existing = [
+        allocation
+        for allocation in allocations
+        if allocation["separate"] == separate
+        and (not require_accessible or allocation["accessible"])
+        and allocation["capacity"] > len(allocation["students"])
+    ]
+    for allocation in existing:
+        take = min(
+            len(remaining),
+            allocation["capacity"] - len(allocation["students"]),
+        )
+        allocation["students"].extend(remaining[:take])
+        remaining = remaining[take:]
+        if not remaining:
+            return True
+
+    eligible = [
+        item for item in candidates
+        if item[0].room_id not in {allocation["room"].room_id for allocation in allocations}
+    ]
+    if not allow_multi_room:
+        eligible = [
+            item for item in eligible if item[1] >= len(remaining)
+        ]
+        if not eligible:
+            return False
+        selected = min(
+            eligible,
+            key=lambda item: (item[1] - len(remaining), item[0].room_id),
+        )
+        allocations.append(
+            {
+                "room": selected[0],
+                "capacity": selected[1],
+                "students": remaining,
+                "separate": separate,
+                "accessible": selected[0].is_accessible,
+            }
+        )
+        return True
+
+    while remaining:
+        fitting = [item for item in eligible if item[1] >= len(remaining)]
+        if fitting:
+            selected = min(
+                fitting,
+                key=lambda item: (item[1] - len(remaining), item[0].room_id),
+            )
+            take = len(remaining)
+        elif eligible:
+            selected = max(
+                eligible,
+                key=lambda item: (item[1], item[0].room_id),
+            )
+            take = selected[1]
+        else:
+            return False
+
+        allocations.append(
+            {
+                "room": selected[0],
+                "capacity": selected[1],
+                "students": remaining[:take],
+                "separate": separate,
+                "accessible": selected[0].is_accessible,
+            }
+        )
+        remaining = remaining[take:]
+        eligible.remove(selected)
+
+    return True
+
+
+def allocate_rooms(ctx, exam, students_with_acc, start_at, end_at):
+    """Return ``(room/student allocations, reason)`` for one exam and slot."""
+    compatible_rooms, rejected = _rooms_for_interval(
+        ctx, exam, start_at, end_at
+    )
+    ctx.last_room_evidence = {
+        "compatible_room_count": len(compatible_rooms),
+        "rejected_room_counts": rejected,
+    }
+    if not compatible_rooms:
+        if rejected["missing_equipment"]:
+            return None, UnassignedExam.Reason.NO_EQUIPMENT_ROOM
+        if rejected["unavailable_or_closed"] or rejected["already_booked"]:
+            return None, UnassignedExam.Reason.ROOM_UNAVAILABLE
+        return None, UnassignedExam.Reason.NO_ROOM_CAPACITY
+
+    allocations = []
+    separate_students = []
+    separate_accessible = []
+    accessible_students = []
+    regular_students = []
+    for student, accommodations in students_with_acc:
+        if needs_separate_room(accommodations):
+            separate_students.append(student)
+            if needs_accessible_room(accommodations):
+                separate_accessible.append(student)
+        elif needs_accessible_room(accommodations):
+            accessible_students.append(student)
+        else:
+            regular_students.append(student)
+
+    requirement = ctx.exam_requirements.get(exam.exam_id)
+    allow_multi_room = requirement.allow_multi_room if requirement else True
+
+    if not allow_multi_room:
+        if separate_students and len(separate_students) != len(students_with_acc):
+            ctx.last_room_evidence["failure_group"] = "separate_room"
+            return None, UnassignedExam.Reason.ACCOMMODATION_UNSATISFIABLE
+        needs_accessible = any(
+            needs_accessible_room(accommodations)
+            for _, accommodations in students_with_acc
+        )
+        candidates = [
+            item for item in compatible_rooms
+            if not needs_accessible or item[0].is_accessible
+        ]
+        candidates = [
+            item for item in candidates
+            if item[1] >= len(students_with_acc)
+        ]
+        if not candidates:
+            ctx.last_room_evidence["failure_group"] = (
+                "accessible_room" if needs_accessible else "room_capacity"
+            )
+            reason = (
+                UnassignedExam.Reason.ACCOMMODATION_UNSATISFIABLE
+                if needs_accessible
+                else UnassignedExam.Reason.NO_ROOM_CAPACITY
+            )
+            return None, reason
+        room, _capacity = min(
+            candidates,
+            key=lambda item: (
+                item[1] - len(students_with_acc),
+                item[0].room_id,
+            ),
+        )
+        return [(room, [student for student, _ in students_with_acc])], None
+
+    accessible_rooms = [
+        item for item in compatible_rooms if item[0].is_accessible
+    ]
+    if separate_accessible:
+        if not _place_group(
+            ctx,
+            separate_accessible,
+            accessible_rooms,
+            allocations,
+            separate=True,
+            allow_multi_room=allow_multi_room,
+            require_accessible=True,
+        ):
+            ctx.last_room_evidence["failure_group"] = "separate_accessible"
+            return None, UnassignedExam.Reason.ACCOMMODATION_UNSATISFIABLE
+
+    separate_regular = [
+        student for student in separate_students
+        if student not in set(separate_accessible)
+    ]
+    if separate_regular and not _place_group(
+        ctx,
+        separate_regular,
+        compatible_rooms,
+        allocations,
+        separate=True,
+        allow_multi_room=allow_multi_room,
+        require_accessible=False,
+    ):
+        ctx.last_room_evidence["failure_group"] = "separate_room"
+        return None, UnassignedExam.Reason.ACCOMMODATION_UNSATISFIABLE
+
+    if accessible_students and not _place_group(
+        ctx,
+        accessible_students,
+        accessible_rooms,
+        allocations,
+        separate=False,
+        allow_multi_room=allow_multi_room,
+        require_accessible=True,
+    ):
+        ctx.last_room_evidence["failure_group"] = "accessible_room"
+        return None, UnassignedExam.Reason.ACCOMMODATION_UNSATISFIABLE
+
+    # Students without a room restriction may use spare seats in rooms that
+    # already contain non-separated accessible students.
+    for allocation in allocations:
+        if allocation["separate"]:
+            continue
+        if allocation["capacity"] <= len(allocation["students"]):
+            continue
+        take = min(
+            len(regular_students),
+            allocation["capacity"] - len(allocation["students"]),
+        )
+        allocation["students"].extend(regular_students[:take])
+        regular_students = regular_students[take:]
+        if not regular_students:
+            break
+
+    if regular_students and not _place_group(
+        ctx,
+        regular_students,
+        compatible_rooms,
+        allocations,
+        separate=False,
+        allow_multi_room=allow_multi_room,
+        require_accessible=False,
+    ):
+        ctx.last_room_evidence["failure_group"] = "room_capacity"
+        return None, UnassignedExam.Reason.NO_ROOM_CAPACITY
+
+    if len(allocations) == 0:
+        return [], None
+    return [
+        (allocation["room"], allocation["students"])
+        for allocation in allocations
+    ], None
+
+======================================================================
+FILE: apps\scheduling\services\scheduler.py
+======================================================================
+"""Schedule exams and persist each run without overwriting prior history."""
+
+import datetime as dt
+import logging
+from collections import Counter
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import DatabaseError, transaction
+from django.utils import timezone
+
+from apps.core.models import Exam
+from apps.core.services.id_generator import make_assignment_id, make_id
+from apps.core.services.lifecycle import transition
+from apps.scheduling.models import (
+    InvigilatorAssignment,
+    ScheduleAssignment,
+    ScheduleEvent,
+    SchedulerRun,
+    StudentRoomAllocation,
+    UnassignedExam,
+)
+from apps.scheduling.services.accommodation import (
+    active_accommodations,
+    required_minutes,
+)
+from apps.scheduling.services.context import build_context
+from apps.scheduling.services.explanations import (
+    explain_unassigned,
+    record_event,
+)
+from apps.scheduling.services.invigilator_allocator import allocate_invigilators
+from apps.scheduling.services.room_allocator import allocate_rooms
+from apps.scheduling.services.slot_allocator import (
+    buffered_overlap,
+    color_exams,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _next_run_id():
+    last_id = SchedulerRun.objects.order_by("-run_id").values_list(
+        "run_id", flat=True
+    ).first()
+    number = int(last_id.rsplit("-", 1)[-1]) + 1 if last_id else 1
+    return make_id("run", number)
+
+
+def _reset_exam_statuses(term):
+    for exam in Exam.objects.filter(
+        term=term,
+        status__in=[Exam.Status.SCHEDULED, Exam.Status.UNASSIGNED],
+    ).order_by("exam_id"):
+        transition(exam, Exam.Status.PLANNED)
+
+
+def _students_for_exam(context, exam):
+    students = context.students_by_exam.get(exam.exam_id, set())
+    return [
+        context.students[student_id]
+        for student_id in sorted(students)
+        if student_id in context.students
+    ]
+
+
+def _student_interval_conflict(context, students, start_at, end_at):
+    for student, _accommodations in students:
+        if any(
+            buffered_overlap(
+                start_at,
+                end_at,
+                booked_start,
+                booked_end,
+                context.policy.get("HARD_BUFFER_MINUTES", 0),
+            )
+            for booked_start, booked_end in context.student_intervals.get(
+                student.student_id, ()
+            )
+        ):
+            return True
+    return False
+
+
+def _candidate_intervals(context, exam, students):
+    """Yield fixed-calendar slots with accommodation-aware durations."""
+    operating_start = context.policy.get("OPERATING_START", "08:00")
+    operating_end = context.policy.get("OPERATING_END", "20:00")
+    earliest = dt.time.fromisoformat(operating_start)
+    latest = dt.time.fromisoformat(operating_end)
+    any_slot = False
+    color = context.time_groups.get(exam.exam_id)
+    preferred_slot = (
+        context.slots[color]
+        if color is not None and color < len(context.slots)
+        else None
+    )
+    slots = (
+        ([preferred_slot] if preferred_slot else [])
+        + [
+            slot
+            for slot in context.slots
+            if slot is not preferred_slot
+        ]
+    )
+    for slot in slots:
+        if slot.start_time < earliest or slot.start_time >= latest:
+            continue
+        start_at = dt.datetime.combine(
+            slot.slot_date, slot.start_time, tzinfo=dt.timezone.utc
+        )
+        student_accommodations = [
+            (
+                student,
+                active_accommodations(
+                    context.accommodations.get(student.student_id, ()),
+                    slot.slot_date,
+                ),
+            )
+            for student in students
+        ]
+        duration = max(
+            (
+                required_minutes(exam.duration_minutes, accommodations)
+                for _, accommodations in student_accommodations
+            ),
+            default=exam.duration_minutes,
+        )
+        end_at = start_at + dt.timedelta(minutes=duration)
+        if end_at.date() != slot.slot_date or end_at.time() > latest:
+            continue
+        if start_at.time() < earliest:
+            continue
+        any_slot = True
+        yield slot, start_at, end_at, student_accommodations
+
+    if not any_slot:
+        return
+
+
+def _commit_assignment(
+    context,
+    exam,
+    room_allocations,
+    invigilator_allocations,
+    students_with_accommodations,
+    start_at,
+    end_at,
+):
+    created_assignments = []
+    students_by_id = {
+        student.student_id: accommodations
+        for student, accommodations in students_with_accommodations
+    }
+
+    for room, students in room_allocations:
+        assignment = ScheduleAssignment.objects.create(
+            assignment_id=make_assignment_id(
+                exam.exam_id, room.room_id, context.run.run_id
+            ),
+            run=context.run,
+            exam=exam,
+            room=room,
+            start_at=start_at,
+            end_at=end_at,
+            allocated_count=len(students),
+        )
+        created_assignments.append(assignment)
+
+        StudentRoomAllocation.objects.bulk_create(
+            [
+                StudentRoomAllocation(
+                    allocation_id=context.next_sra(),
+                    assignment=assignment,
+                    run=context.run,
+                    exam=exam,
+                    student=student,
+                    required_minutes=required_minutes(
+                        exam.duration_minutes,
+                        students_by_id[student.student_id],
+                    ),
+                )
+                for student in students
+            ],
+            batch_size=1000,
+        )
+
+        invigilators = next(
+            (
+                assigned
+                for assigned_room, assigned in invigilator_allocations
+                if assigned_room.room_id == room.room_id
+            ),
+            [],
+        )
+        InvigilatorAssignment.objects.bulk_create(
+            [
+                InvigilatorAssignment(
+                    ias_id=context.next_ias(),
+                    assignment=assignment,
+                    invigilator=invigilator,
+                    role=(
+                        InvigilatorAssignment.Role.CHIEF
+                        if index == 0
+                        else InvigilatorAssignment.Role.ASSISTANT
+                    ),
+                )
+                for index, invigilator in enumerate(invigilators)
+            ],
+            batch_size=1000,
+        )
+
+    transition(exam, Exam.Status.SCHEDULED)
+    record_event(
+        context,
+        exam,
+        ScheduleEvent.EventType.ASSIGNED,
+        {
+            "assignment_ids": [
+                assignment.assignment_id for assignment in created_assignments
+            ],
+            "start_at": start_at.isoformat(),
+            "end_at": end_at.isoformat(),
+            "allocated_count": sum(
+                len(students) for _, students in room_allocations
+            ),
+            "room_count": len(room_allocations),
+        },
+        assignment=created_assignments[0] if len(created_assignments) == 1 else None,
+    )
+
+    # Update feasibility state only after the database writes have succeeded.
+    for room, students in room_allocations:
+        context.room_bookings[room.room_id].append((start_at, end_at))
+        invigilators = next(
+            assigned
+            for assigned_room, assigned in invigilator_allocations
+            if assigned_room.room_id == room.room_id
+        )
+        for invigilator in invigilators:
+            invigilator_id = invigilator.invigilator_id
+            context.invigilator_bookings[invigilator_id].append(
+                (start_at, end_at)
+            )
+            workload = getattr(context, "invigilator_workload_minutes", None)
+            if workload is None:
+                context.invigilator_workload_minutes = workload = Counter()
+            workload[invigilator_id] += int(
+                (end_at - start_at).total_seconds() // 60
+            )
+        for student in students:
+            context.student_intervals[student.student_id].append(
+                (start_at, end_at)
+            )
+
+    context.exam_slots[exam.exam_id] = (start_at, end_at)
+    return created_assignments
+
+
+def _record_unassigned(context, exam, reasons, evidence=None):
+    if reasons:
+        primary_reason, _count = min(
+            reasons.items(), key=lambda item: (-item[1], item[0])
+        )
+    else:
+        primary_reason = UnassignedExam.Reason.NO_FEASIBLE_ASSIGNMENT
+
+    valid_reasons = {choice.value for choice in UnassignedExam.Reason}
+    if primary_reason not in valid_reasons:
+        primary_reason = UnassignedExam.Reason.NO_FEASIBLE_ASSIGNMENT
+
+    detail = {
+        "reasons": dict(sorted(reasons.items())),
+        "rejection_evidence": evidence or {},
+    }
+    UnassignedExam.objects.create(
+        unassigned_id=context.next_una(),
+        run=context.run,
+        exam=exam,
+        primary_reason_code=primary_reason,
+        evidence=explain_unassigned(exam.exam_id, primary_reason, detail),
+    )
+    transition(exam, Exam.Status.UNASSIGNED)
+    record_event(
+        context,
+        exam,
+        ScheduleEvent.EventType.UNASSIGNED,
+        {
+            "primary_reason": primary_reason,
+            **detail,
+        },
+    )
+    return primary_reason
+
+
+def try_schedule_exam(context, exam):
+    """Try every configured slot, returning ``(scheduled, rejection_counts)``."""
+    students = _students_for_exam(context, exam)
+    if not students:
+        transition(exam, Exam.Status.SCHEDULED)
+        record_event(
+            context,
+            exam,
+            ScheduleEvent.EventType.ASSIGNED,
+            {"reason": "no_active_enrollments", "allocated_count": 0},
+        )
+        return True, Counter()
+
+    reasons = Counter()
+    evidence = {
+        "student_count": len(students),
+        "slots_considered": 0,
+        "rooms": {},
+    }
+    for _slot, start_at, end_at, students_with_accommodations in (
+        _candidate_intervals(context, exam, students)
+    ):
+        evidence["slots_considered"] += 1
+        if _student_interval_conflict(
+            context, students_with_accommodations, start_at, end_at
+        ):
+            reasons[UnassignedExam.Reason.NO_CONFLICT_FREE_SLOT.value] += 1
+            continue
+
+        room_allocations, room_reason = allocate_rooms(
+            context,
+            exam,
+            students_with_accommodations,
+            start_at,
+            end_at,
+        )
+        if room_allocations is None:
+            reasons[room_reason.value] += 1
+            evidence["rooms"][room_reason.value] = (
+                context.last_room_evidence
+            )
+            continue
+
+        invigilator_allocations, staffing_reason = allocate_invigilators(
+            context, exam, room_allocations, start_at, end_at
+        )
+        if invigilator_allocations is None:
+            reasons[staffing_reason.value] += 1
+            continue
+
+        _commit_assignment(
+            context,
+            exam,
+            room_allocations,
+            invigilator_allocations,
+            students_with_accommodations,
+            start_at,
+            end_at,
+        )
+        return True, reasons
+
+    if evidence["slots_considered"] == 0:
+        reasons[UnassignedExam.Reason.NO_FEASIBLE_ASSIGNMENT.value] += 1
+        evidence["detail"] = (
+            "No exam-calendar slot can contain the required duration "
+            "within the configured operating hours."
+        )
+    _record_unassigned(context, exam, reasons, evidence)
+    return False, reasons
+
+
+@transaction.atomic
+def run_scheduler(seed=None, run_type=SchedulerRun.RunType.BASELINE, reset_exams=True):
+    """Run the deterministic scheduler and append a new run to history."""
+    valid_run_types = {choice.value for choice in SchedulerRun.RunType}
+    if run_type not in valid_run_types:
+        raise ValueError(f"Unknown run type {run_type!r}.")
+
+    policy = settings.SCHEDULER_POLICY
+    term = policy["TERM"]
+    if reset_exams:
+        _reset_exam_statuses(term)
+
+    run = SchedulerRun.objects.create(
+        run_id=_next_run_id(),
+        run_type=run_type,
+        seed=seed,
+        algorithm_version="phase-4-dsatur-1",
+        notes=f"term={term}",
+    )
+    context = build_context(run, term, policy)
+    ordered_exams, context.time_groups = color_exams(
+        context.graph, context.students_by_exam, context
+    )
+
+    scheduled_count = 0
+    exams_with_assignments = 0
+    unassigned_count = 0
+    failures = []
+
+    for exam in ordered_exams:
+        if exam.status != Exam.Status.PLANNED:
+            continue
+        savepoint_id = transaction.savepoint()
+        try:
+            scheduled, _reasons = try_schedule_exam(context, exam)
+            transaction.savepoint_commit(savepoint_id)
+            if scheduled:
+                scheduled_count += 1
+                if context.exam_slots.get(exam.exam_id):
+                    exams_with_assignments += 1
+            else:
+                unassigned_count += 1
+        except (DatabaseError, ValidationError, ValueError):
+            transaction.savepoint_rollback(savepoint_id)
+            logger.exception(
+                "Could not persist a valid schedule for exam %s.", exam.exam_id
+            )
+            exam.refresh_from_db()
+            failure_evidence = {
+                "error": "Schedule persistence failed for this exam.",
+            }
+            failure_savepoint = transaction.savepoint()
+            _record_unassigned(
+                context,
+                exam,
+                Counter(
+                    {
+                        UnassignedExam.Reason.NO_FEASIBLE_ASSIGNMENT.value: 1
+                    }
+                ),
+                failure_evidence,
+            )
+            transaction.savepoint_commit(failure_savepoint)
+            unassigned_count += 1
+            failures.append(exam.exam_id)
+
+    final_status = (
+        SchedulerRun.Status.FAILED
+        if failures
+        else SchedulerRun.Status.COMPLETED
+    )
+    transition(run, final_status)
+    run.finished_at = timezone.now()
+    run.notes = (
+        f"term={term}; scheduled={scheduled_count}; "
+        f"scheduled_with_assignments={exams_with_assignments}; "
+        f"unassigned={unassigned_count}; failed_exam_persistence={len(failures)}"
+    )
+    run.save(update_fields=["finished_at", "notes"])
+    return run
+
+======================================================================
+FILE: apps\scheduling\services\slot_allocator.py
+======================================================================
+"""DSatur exam ordering and half-open interval helpers."""
+
+import datetime as dt
+
+
+def overlap(first_start, first_end, second_start, second_end):
+    return first_start < second_end and second_start < first_end
+
+
+def buffered_overlap(
+    first_start, first_end, second_start, second_end, buffer_minutes=0
+):
+    if buffer_minutes < 0:
+        raise ValueError("buffer_minutes must be non-negative.")
+    buffer = dt.timedelta(minutes=buffer_minutes)
+    return overlap(
+        first_start - buffer,
+        first_end + buffer,
+        second_start,
+        second_end,
+    )
+
+
+def _restriction_score(exam, context):
+    requirement = context.exam_requirements.get(exam.exam_id)
+    equipment_count = len(
+        getattr(context, "exam_equipment", {}).get(exam.exam_id, ())
+    )
+    return (
+        equipment_count,
+        requirement.invigilator_ratio if requirement else 50,
+    )
+
+
+def color_exams(graph, students_by_exam, context=None):
+    """Return a deterministic DSatur ordering and a time-group color per exam."""
+    remaining = {exam.exam_id: exam for exam in graph.exams}
+    colors = {}
+    ordered = []
+
+    while remaining:
+        def priority(exam):
+            neighbor_colors = {
+                colors[neighbor]
+                for neighbor in graph.neighbors(exam.exam_id)
+                if neighbor in colors
+            }
+            restriction = _restriction_score(exam, context) if context else (0, 50)
+            return (
+                -len(neighbor_colors),
+                -graph.degree.get(exam.exam_id, 0),
+                -len(students_by_exam.get(exam.exam_id, ())),
+                -restriction[0],
+                restriction[1],
+                -exam.duration_minutes,
+                exam.exam_id,
+            )
+
+        exam = min(remaining.values(), key=priority)
+        used_colors = {
+            colors[neighbor]
+            for neighbor in graph.neighbors(exam.exam_id)
+            if neighbor in colors
+        }
+        color = 0
+        while color in used_colors:
+            color += 1
+        colors[exam.exam_id] = color
+        ordered.append(exam)
+        del remaining[exam.exam_id]
+
+    return ordered, colors
+
+
+def order_exams(graph, students_by_exam, context=None):
+    """Return exams in deterministic DSatur priority order."""
+    return color_exams(graph, students_by_exam, context)[0]
+
+======================================================================
+FILE: apps\scheduling\services\__init__.py
 ======================================================================
 
 ======================================================================
@@ -5100,6 +6527,207 @@ FILE: apps\validation\management\__init__.py
 ======================================================================
 
 ======================================================================
+FILE: apps\validation\management\commands\detect_violations.py
+======================================================================
+from django.core.management.base import BaseCommand, CommandError
+
+from apps.scheduling.models import SchedulerRun
+from apps.validation.models import DetectedViolation
+from apps.validation.services.validation_runner import run_all_checks
+
+
+class Command(BaseCommand):
+    help = "Validate an ANOMALY_FIXTURE run and summarize detected violations."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--run", default=None)
+
+    def handle(self, *args, **options):
+        run_id = options["run"]
+        if run_id:
+            try:
+                run = SchedulerRun.objects.get(pk=run_id)
+            except SchedulerRun.DoesNotExist as error:
+                raise CommandError(f"Scheduler run {run_id} was not found.") from error
+        else:
+            run = (
+                SchedulerRun.objects.filter(
+                    run_type=SchedulerRun.RunType.ANOMALY_FIXTURE
+                )
+                .order_by("-run_id")
+                .first()
+            )
+            if run is None:
+                raise CommandError(
+                    "No ANOMALY_FIXTURE run exists; run inject_anomalies first."
+                )
+        if run.run_type != SchedulerRun.RunType.ANOMALY_FIXTURE:
+            raise CommandError(
+                f"{run.run_id} is not an ANOMALY_FIXTURE run."
+            )
+
+        try:
+            validation_run, result = run_all_checks(run)
+        except ValueError as error:
+            raise CommandError(str(error)) from error
+
+        counts = {}
+        for code in (
+            DetectedViolation.objects.filter(
+                validation_run=validation_run
+            ).values_list("violation_code", flat=True)
+        ):
+            counts[code] = counts.get(code, 0) + 1
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"{validation_run.validation_id}: validated {run.run_id}"
+            )
+        )
+        for code, count in sorted(counts.items()):
+            self.stdout.write(f"  {code}: {count}")
+        self.stdout.write(f"  total: {result['failures']} violations")
+
+======================================================================
+FILE: apps\validation\management\commands\evaluate_anomalies.py
+======================================================================
+from django.core.management.base import BaseCommand, CommandError
+
+from apps.scheduling.models import SchedulerRun
+from apps.validation.models import ValidationRun
+from apps.validation.services.evaluator import (
+    evaluate,
+    write_evaluation_report,
+)
+
+
+class Command(BaseCommand):
+    help = "Evaluate anomaly detection precision, recall, and F1."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--validation", default=None)
+        parser.add_argument("--run", default=None)
+
+    def handle(self, *args, **options):
+        if options["validation"]:
+            try:
+                validation_run = ValidationRun.objects.select_related(
+                    "scheduler_run"
+                ).get(pk=options["validation"])
+            except ValidationRun.DoesNotExist as error:
+                raise CommandError(
+                    f"Validation run {options['validation']} was not found."
+                ) from error
+        elif options["run"]:
+            validation_run = (
+                ValidationRun.objects.filter(
+                    scheduler_run_id=options["run"]
+                )
+                .select_related("scheduler_run")
+                .order_by("-validation_id")
+                .first()
+            )
+            if validation_run is None:
+                raise CommandError(
+                    f"No validation run exists for {options['run']}."
+                )
+        else:
+            validation_run = (
+                ValidationRun.objects.filter(
+                    scheduler_run__run_type=SchedulerRun.RunType.ANOMALY_FIXTURE
+                )
+                .select_related("scheduler_run")
+                .order_by("-validation_id")
+                .first()
+            )
+            if validation_run is None:
+                raise CommandError(
+                    "No anomaly validation exists; run detect_violations first."
+                )
+
+        if (
+            validation_run.scheduler_run.run_type
+            != SchedulerRun.RunType.ANOMALY_FIXTURE
+        ):
+            raise CommandError("Evaluation requires an ANOMALY_FIXTURE run.")
+        try:
+            result = evaluate(validation_run)
+        except (FileNotFoundError, ValueError) as error:
+            raise CommandError(str(error)) from error
+        report_path = write_evaluation_report(result)
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"{result['validation_id']} on {result['scheduler_run']}: "
+                f"TP={result['tp']} FP={result['fp']} FN={result['fn']} "
+                f"precision={result['precision']} recall={result['recall']} "
+                f"F1={result['f1']}"
+            )
+        )
+        self.stdout.write(f"  report: {report_path}")
+
+======================================================================
+FILE: apps\validation\management\commands\inject_anomalies.py
+======================================================================
+from django.core.management.base import BaseCommand, CommandError
+from django.db import DatabaseError
+
+from apps.scheduling.models import SchedulerRun
+from apps.validation.services.anomaly_injector import inject
+
+
+class Command(BaseCommand):
+    help = "Create a separate anomaly fixture from a completed baseline run."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--baseline",
+            default=None,
+            help="Completed baseline run ID; defaults to the latest baseline.",
+        )
+
+    def handle(self, *args, **options):
+        if options["baseline"]:
+            baseline_id = options["baseline"]
+        else:
+            baseline = (
+                SchedulerRun.objects.filter(
+                    run_type=SchedulerRun.RunType.BASELINE,
+                    status=SchedulerRun.Status.COMPLETED,
+                )
+                .order_by("-run_id")
+                .first()
+            )
+            if baseline is None:
+                raise CommandError(
+                    "No completed baseline exists; run run_scheduler first."
+                )
+            baseline_id = baseline.run_id
+
+        try:
+            anomaly_run, labels, selected = inject(baseline_id)
+        except (ValueError, OSError, DatabaseError) as error:
+            raise CommandError(f"Anomaly injection failed: {error}") from error
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Created {anomaly_run.run_id} (ANOMALY_FIXTURE) "
+                f"from {baseline_id}."
+            )
+        )
+        self.stdout.write(
+            "  exams: "
+            + ", ".join(
+                f"{key}={exam_id}" for key, exam_id in selected.items()
+            )
+        )
+        self.stdout.write(f"  ground-truth rows: {len(labels)}")
+        for label in labels:
+            self.stdout.write(
+                f"  {label['anomaly_id']} | {label['issue_type']} | "
+                f"{label['expected_violation_code']} | "
+                f"{label['assignment_id']}"
+            )
+
+======================================================================
 FILE: apps\validation\management\commands\validate_data.py
 ======================================================================
 import json
@@ -5142,6 +6770,68 @@ class Command(BaseCommand):
             self.style.SUCCESS(
                 f"OK - 0 failures across {len(summary['checks'])} checks."
             )
+        )
+
+======================================================================
+FILE: apps\validation\management\commands\validate_schedule.py
+======================================================================
+from django.core.management.base import BaseCommand, CommandError
+
+from apps.scheduling.models import SchedulerRun
+from apps.validation.services.validation_runner import run_all_checks
+
+
+class Command(BaseCommand):
+    help = "Independently validate a completed SchedulerRun."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--run",
+            default=None,
+            help="Scheduler run ID; defaults to the latest run.",
+        )
+
+    def handle(self, *args, **options):
+        run_id = options["run"]
+        if run_id:
+            try:
+                run = SchedulerRun.objects.get(pk=run_id)
+            except SchedulerRun.DoesNotExist as error:
+                raise CommandError(f"Scheduler run {run_id} was not found.") from error
+        else:
+            run = SchedulerRun.objects.order_by("-run_id").first()
+            if run is None:
+                raise CommandError(
+                    "No scheduler run exists; run run_scheduler first."
+                )
+
+        try:
+            validation_run, result = run_all_checks(run)
+        except ValueError as error:
+            raise CommandError(str(error)) from error
+
+        if result["failures"]:
+            for check in result["checks"]:
+                if check["failures"]:
+                    self.stderr.write(
+                        f"  {check['check']}: {check['failures']} failure(s)"
+                    )
+            raise CommandError(
+                f"{validation_run.validation_id}: FAIL — "
+                f"{result['checks_performed']} checks, "
+                f"{result['failures']} violations."
+            )
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"{validation_run.validation_id}: PASS — "
+                f"{result['checks_performed']} checks, 0 violations."
+            )
+        )
+        self.stdout.write(
+            f"  Scorecard: data/validation_scorecard.json"
+        )
+        self.stdout.write(
+            f"  Business metrics: {result['business_metrics']}"
         )
 
 ======================================================================
@@ -5265,6 +6955,987 @@ class Migration(migrations.Migration):
 ======================================================================
 FILE: apps\validation\migrations\__init__.py
 ======================================================================
+
+======================================================================
+FILE: apps\validation\services\anomaly_injector.py
+======================================================================
+"""Create a separate run containing five controlled scheduling anomalies."""
+
+import csv
+import datetime as dt
+import itertools
+import json
+from collections import defaultdict
+from itertools import islice
+from pathlib import Path
+
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+
+from apps.core.models import (
+    Accommodation,
+    ExamRequirementEquipment,
+    Invigilator,
+    Room,
+    RoomCapacity,
+)
+from apps.core.services.id_generator import make_assignment_id, make_id
+from apps.core.services.lifecycle import transition
+from apps.scheduling.models import (
+    Availability,
+    InvigilatorAssignment,
+    RoomClosure,
+    ScheduleAssignment,
+    ScheduleEvent,
+    SchedulerRun,
+    StudentRoomAllocation,
+)
+from apps.validation.models import DetectedViolation
+
+CODE = DetectedViolation.Code
+
+
+def _next_id(model, field_name, kind):
+    last_id = model.objects.order_by(f"-{field_name}").values_list(
+        field_name, flat=True
+    ).first()
+    number = int(last_id.split("-")[-1]) + 1 if last_id else 1
+    return make_id(kind, number)
+
+
+class _CopyContext:
+    def __init__(self, run):
+        self.run = run
+        self.sra_number = _last_number(
+            StudentRoomAllocation, "allocation_id"
+        )
+        self.ias_number = _last_number(
+            InvigilatorAssignment, "ias_id"
+        )
+        self.event_number = _last_number(ScheduleEvent, "event_id")
+        self.closure_number = _last_number(RoomClosure, "closure_id")
+        self.assignments = {}
+
+    def next_sra(self):
+        self.sra_number += 1
+        return make_id("student_allocation", self.sra_number)
+
+    def next_ias(self):
+        self.ias_number += 1
+        return make_id("invigilator_assignment", self.ias_number)
+
+    def next_event(self):
+        self.event_number += 1
+        return make_id("event", self.event_number)
+
+    def next_closure(self):
+        self.closure_number += 1
+        return make_id("closure", self.closure_number)
+
+
+def _last_number(model, field_name):
+    last_id = model.objects.order_by(f"-{field_name}").values_list(
+        field_name, flat=True
+    ).first()
+    return int(last_id.split("-")[-1]) if last_id else 0
+
+
+def _effective_capacity(room_id, on_date, capacities):
+    return max(
+        (
+            capacity
+            for start, end, capacity in capacities.get(room_id, ())
+            if start <= on_date and (end is None or end >= on_date)
+        ),
+        default=0,
+    )
+
+
+def _covered(intervals, start_at, end_at):
+    return any(
+        available_start <= start_at and available_end >= end_at
+        for available_start, available_end in intervals
+    )
+
+
+def _overlap(first_start, first_end, second_start, second_end):
+    return first_start < second_end and second_start < first_end
+
+
+def _copy_assignment(ctx, baseline_assignment):
+    assignment = ScheduleAssignment.objects.create(
+        assignment_id=make_assignment_id(
+            baseline_assignment.exam_id,
+            baseline_assignment.room_id,
+            ctx.run.run_id,
+        ),
+        run=ctx.run,
+        exam_id=baseline_assignment.exam_id,
+        room_id=baseline_assignment.room_id,
+        start_at=baseline_assignment.start_at,
+        end_at=baseline_assignment.end_at,
+        allocated_count=baseline_assignment.allocated_count,
+        status=ScheduleAssignment.Status.ASSIGNED,
+    )
+    for student_id, required_minutes in (
+        StudentRoomAllocation.objects.filter(
+            assignment=baseline_assignment
+        ).values_list("student_id", "required_minutes")
+    ):
+        StudentRoomAllocation.objects.create(
+            allocation_id=ctx.next_sra(),
+            assignment=assignment,
+            run=ctx.run,
+            exam_id=baseline_assignment.exam_id,
+            student_id=student_id,
+            required_minutes=required_minutes,
+        )
+    for invigilator_id, role in (
+        InvigilatorAssignment.objects.filter(
+            assignment=baseline_assignment
+        ).values_list("invigilator_id", "role")
+    ):
+        InvigilatorAssignment.objects.create(
+            ias_id=ctx.next_ias(),
+            assignment=assignment,
+            invigilator_id=invigilator_id,
+            role=role,
+        )
+    ctx.assignments[baseline_assignment.assignment_id] = assignment
+    return assignment
+
+
+def _replace_assignment_room(ctx, assignment, target_room_id):
+    students = list(
+        assignment.student_allocations.values_list(
+            "student_id", "required_minutes"
+        )
+    )
+    invigilators = list(
+        assignment.invigilator_assignments.values_list(
+            "invigilator_id", "role"
+        )
+    )
+    old_id = assignment.assignment_id
+    assignment.delete()
+    replacement = ScheduleAssignment.objects.create(
+        assignment_id=make_assignment_id(
+            assignment.exam_id, target_room_id, ctx.run.run_id
+        ),
+        run=ctx.run,
+        exam_id=assignment.exam_id,
+        room_id=target_room_id,
+        start_at=assignment.start_at,
+        end_at=assignment.end_at,
+        allocated_count=assignment.allocated_count,
+        status=ScheduleAssignment.Status.ASSIGNED,
+    )
+    for student_id, required_minutes in students:
+        StudentRoomAllocation.objects.create(
+            allocation_id=ctx.next_sra(),
+            assignment=replacement,
+            run=ctx.run,
+            exam_id=assignment.exam_id,
+            student_id=student_id,
+            required_minutes=required_minutes,
+        )
+    for invigilator_id, role in invigilators:
+        InvigilatorAssignment.objects.create(
+            ias_id=ctx.next_ias(),
+            assignment=replacement,
+            invigilator_id=invigilator_id,
+            role=role,
+        )
+    ctx.assignments[old_id] = replacement
+    return replacement
+
+
+def _replace_invigilators(ctx, assignment, invigilator_ids):
+    InvigilatorAssignment.objects.filter(assignment=assignment).delete()
+    for index, invigilator_id in enumerate(invigilator_ids):
+        InvigilatorAssignment.objects.create(
+            ias_id=ctx.next_ias(),
+            assignment=assignment,
+            invigilator_id=invigilator_id,
+            role=(
+                InvigilatorAssignment.Role.CHIEF
+                if index == 0
+                else InvigilatorAssignment.Role.ASSISTANT
+            ),
+        )
+
+
+def _write_ground_truth(rows, run):
+    data_dir = Path(settings.BASE_DIR) / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "anomaly_id",
+        "issue_type",
+        "assignment_id",
+        "affected_entity_id",
+        "expected_violation_code",
+        "run_id",
+    ]
+    enriched = [{**row, "run_id": run.run_id} for row in rows]
+    csv_path = data_dir / "ground_truth.csv"
+    json_path = data_dir / "ground_truth.json"
+    csv_temp = csv_path.with_suffix(".csv.tmp")
+    json_temp = json_path.with_suffix(".json.tmp")
+    with csv_temp.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(enriched)
+    json_temp.write_text(
+        json.dumps(enriched, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    csv_temp.replace(csv_path)
+    json_temp.replace(json_path)
+
+
+def _anomaly_row(anomaly_id, issue_type, assignment_id, entity_id, code):
+    return {
+        "anomaly_id": anomaly_id,
+        "issue_type": issue_type,
+        "assignment_id": assignment_id,
+        "affected_entity_id": entity_id,
+        "expected_violation_code": code,
+    }
+
+
+def inject(baseline_run_id):
+    """Clone selected baseline assignments and add five labeled anomalies."""
+    with transaction.atomic():
+        try:
+            baseline = SchedulerRun.objects.get(pk=baseline_run_id)
+        except SchedulerRun.DoesNotExist as error:
+            raise ValueError(
+                f"Baseline scheduler run {baseline_run_id} was not found."
+            ) from error
+        if baseline.run_type != SchedulerRun.RunType.BASELINE:
+            raise ValueError(f"{baseline_run_id} is not a BASELINE run.")
+        if baseline.status != SchedulerRun.Status.COMPLETED:
+            raise ValueError(f"{baseline_run_id} is not COMPLETED.")
+
+        selection = _select_fixture(baseline)
+        run = SchedulerRun.objects.create(
+            run_id=_next_id(SchedulerRun, "run_id", "run"),
+            run_type=SchedulerRun.RunType.ANOMALY_FIXTURE,
+            status=SchedulerRun.Status.RUNNING,
+            seed=baseline.seed,
+            algorithm_version="phase-5-anomaly-fixture-1",
+            notes=f"Anomaly fixture copied from {baseline.run_id}.",
+        )
+        ctx = _CopyContext(run)
+        exam_ids = {
+            selection[key].exam_id
+            for key in ("A", "B", "C", "D", "E", "F", "G")
+        }
+        source_assignments = list(
+            ScheduleAssignment.objects.filter(
+                run=baseline,
+                status=ScheduleAssignment.Status.ASSIGNED,
+                exam_id__in=exam_ids,
+            ).order_by("exam_id", "assignment_id")
+        )
+        for source in source_assignments:
+            _copy_assignment(ctx, source)
+
+        a = ctx.assignments[selection["A"].assignment_id]
+        b = ctx.assignments[selection["B"].assignment_id]
+        b.start_at = a.start_at
+        b.end_at = a.end_at
+        b.save(update_fields=["start_at", "end_at"])
+        _replace_invigilators(
+            ctx, b, selection["B_invigilators"]
+        )
+
+        c = _replace_assignment_room(
+            ctx,
+            ctx.assignments[selection["C"].assignment_id],
+            selection["C_room"].room_id,
+        )
+
+        d = ctx.assignments[selection["D"].assignment_id]
+        e = ctx.assignments[selection["E"].assignment_id]
+        e.start_at = d.start_at
+        e.end_at = d.end_at
+        e.save(update_fields=["start_at", "end_at"])
+        _replace_invigilators(
+            ctx, e, selection["E_invigilators"]
+        )
+
+        f = ctx.assignments[selection["F"].assignment_id]
+        f.end_at = f.start_at + dt.timedelta(
+            minutes=f.exam.duration_minutes
+        )
+        f.save(update_fields=["end_at"])
+
+        g = ctx.assignments[selection["G"].assignment_id]
+        RoomClosure.objects.create(
+            closure_id=ctx.next_closure(),
+            room_id=g.room_id,
+            run=run,
+            start_at=g.start_at - dt.timedelta(minutes=10),
+            end_at=g.start_at + dt.timedelta(minutes=10),
+            reason=RoomClosure.Reason.MAINTENANCE,
+        )
+
+        selected_assignments = list(
+            ScheduleAssignment.objects.filter(run=run).order_by(
+                "exam_id", "assignment_id"
+            )
+        )
+        for exam_id in sorted(exam_ids):
+            exam_assignments = [
+                assignment
+                for assignment in selected_assignments
+                if assignment.exam_id == exam_id
+            ]
+            ScheduleEvent.objects.create(
+                event_id=ctx.next_event(),
+                run=run,
+                exam_id=exam_id,
+                assignment=(
+                    exam_assignments[0]
+                    if len(exam_assignments) == 1
+                    else None
+                ),
+                event_type=ScheduleEvent.EventType.ASSIGNED,
+                detail={
+                    "fixture": True,
+                    "assignment_ids": [
+                        assignment.assignment_id
+                        for assignment in exam_assignments
+                    ],
+                },
+            )
+
+        shared_student = selection["shared_student"]
+        shared_invigilator = selection["D_invigilator"]
+        rows = [
+            _anomaly_row(
+                "EDGE-001",
+                "STUDENT_OVERLAP",
+                a.assignment_id,
+                shared_student,
+                CODE.STUDENT_DOUBLE_BOOKING.value,
+            ),
+            _anomaly_row(
+                "EDGE-001",
+                "STUDENT_OVERLAP",
+                b.assignment_id,
+                shared_student,
+                CODE.STUDENT_DOUBLE_BOOKING.value,
+            ),
+            _anomaly_row(
+                "EDGE-002",
+                "CAPACITY_EXCEEDED",
+                c.assignment_id,
+                c.room_id,
+                CODE.ROOM_CAPACITY_EXCEEDED.value,
+            ),
+            _anomaly_row(
+                "EDGE-003",
+                "INVIGILATOR_CLASH",
+                d.assignment_id,
+                shared_invigilator,
+                CODE.INVIGILATOR_DOUBLE_BOOKED.value,
+            ),
+            _anomaly_row(
+                "EDGE-003",
+                "INVIGILATOR_CLASH",
+                e.assignment_id,
+                shared_invigilator,
+                CODE.INVIGILATOR_DOUBLE_BOOKED.value,
+            ),
+            _anomaly_row(
+                "EDGE-004",
+                "ACCOMMODATION_BREACH",
+                f.assignment_id,
+                selection["F_student"],
+                CODE.ACCOMMODATION_VIOLATION.value,
+            ),
+            _anomaly_row(
+                "EDGE-005",
+                "ROOM_CLOSED",
+                g.assignment_id,
+                g.room_id,
+                CODE.ROOM_UNAVAILABLE_VIOLATION.value,
+            ),
+        ]
+        transition(run, SchedulerRun.Status.COMPLETED)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["finished_at"])
+
+    _write_ground_truth(rows, run)
+    return run, rows, {
+        key: selection[key].exam_id
+        for key in ("A", "B", "C", "D", "E", "F", "G")
+    }
+
+
+def _select_fixture(baseline):
+    assignments = list(
+        ScheduleAssignment.objects.filter(
+            run=baseline,
+            status=ScheduleAssignment.Status.ASSIGNED,
+        )
+        .select_related("exam", "room", "exam__requirement")
+        .order_by("exam_id", "assignment_id")
+    )
+    if len({assignment.exam_id for assignment in assignments}) < 7:
+        raise ValueError(
+            "At least seven assigned exams are required to build the fixture."
+        )
+
+    assignment_students = defaultdict(set)
+    assignment_required = defaultdict(dict)
+    for assignment_id, student_id, required_minutes in (
+        StudentRoomAllocation.objects.filter(run=baseline).values_list(
+            "assignment_id", "student_id", "required_minutes"
+        )
+    ):
+        assignment_students[assignment_id].add(student_id)
+        assignment_required[assignment_id][student_id] = required_minutes
+    assignment_invigilators = defaultdict(list)
+    for assignment_id, invigilator_id in (
+        InvigilatorAssignment.objects.filter(
+            assignment__run=baseline
+        ).values_list("assignment_id", "invigilator_id")
+    ):
+        assignment_invigilators[assignment_id].append(invigilator_id)
+    assignments_by_exam = defaultdict(list)
+    for assignment in assignments:
+        assignments_by_exam[assignment.exam_id].append(assignment)
+
+    equipment_by_exam = defaultdict(set)
+    for exam_id, equipment_id in (
+        ExamRequirementEquipment.objects.filter(
+            requirement__exam_id__in=assignments_by_exam
+        ).values_list("requirement__exam_id", "equipment_id")
+    ):
+        equipment_by_exam[exam_id].add(equipment_id)
+    capacities = defaultdict(list)
+    for room_id, start, end, capacity in RoomCapacity.objects.values_list(
+        "room_id", "effective_from", "effective_to", "exam_capacity"
+    ):
+        capacities[room_id].append((start, end, capacity))
+    rooms = {
+        room.room_id: room
+        for room in Room.objects.filter(status=Room.Status.ACTIVE).prefetch_related(
+            "equipment"
+        )
+    }
+    room_equipment = {
+        room_id: {equipment.code for equipment in room.equipment.all()}
+        for room_id, room in rooms.items()
+    }
+    room_availability = defaultdict(list)
+    invigilator_availability = defaultdict(list)
+    for room_id, invigilator_id, start_at, end_at in Availability.objects.values_list(
+        "room_id", "invigilator_id", "start_at", "end_at"
+    ):
+        if room_id:
+            room_availability[room_id].append((start_at, end_at))
+        if invigilator_id:
+            invigilator_availability[invigilator_id].append(
+                (start_at, end_at)
+            )
+    closures = defaultdict(list)
+    for room_id, start_at, end_at in RoomClosure.objects.filter(
+        run__isnull=True
+    ).values_list(
+        "room_id", "start_at", "end_at"
+    ):
+        closures[room_id].append((start_at, end_at))
+    active_invigilators = list(
+        Invigilator.objects.filter(status=Invigilator.Status.ACTIVE)
+        .order_by("invigilator_id")
+        .values_list("invigilator_id", flat=True)
+    )
+    accommodations_by_student = defaultdict(list)
+    for accommodation in Accommodation.objects.filter(
+        status=Accommodation.Status.ACTIVE
+    ):
+        accommodations_by_student[accommodation.student_id].append(
+            accommodation
+        )
+
+    def accommodations_for(student_id, on_date):
+        return [
+            accommodation
+            for accommodation in accommodations_by_student[student_id]
+            if accommodation.effective_from <= on_date
+            and (
+                accommodation.effective_to is None
+                or accommodation.effective_to >= on_date
+            )
+        ]
+
+    def required_for(assignment_id):
+        return max(
+            assignment_required[assignment_id].values(),
+            default=0,
+        )
+
+    def staff_count(assignment):
+        requirement = getattr(assignment.exam, "requirement", None)
+        ratio = requirement.invigilator_ratio if requirement else 50
+        return max(1, (assignment.allocated_count + ratio - 1) // ratio)
+
+    overlap_candidates = []
+    for first in assignments:
+        first_exam_students = set().union(
+            *(
+                assignment_students[row.assignment_id]
+                for row in assignments_by_exam[first.exam_id]
+            )
+        )
+        for second in assignments:
+            if (
+                first.exam_id == second.exam_id
+                or first.room_id == second.room_id
+            ):
+                continue
+            shared = assignment_students[first.assignment_id] & assignment_students[
+                second.assignment_id
+            ]
+            if not shared:
+                continue
+            other_first_rooms = first_exam_students - assignment_students[
+                first.assignment_id
+            ]
+            if assignment_students[second.assignment_id] & other_first_rooms:
+                continue
+            if required_for(second.assignment_id) > (
+                first.end_at - first.start_at
+            ).total_seconds() / 60:
+                continue
+            if not _covered(
+                room_availability[second.room_id],
+                first.start_at,
+                first.end_at,
+            ):
+                continue
+            if any(
+                _overlap(
+                    first.start_at,
+                    first.end_at,
+                    closure_start,
+                    closure_end,
+                )
+                for closure_start, closure_end in closures[second.room_id]
+            ):
+                continue
+            overlap_candidates.append((first, second, min(shared)))
+    overlap_candidates.sort(
+        key=lambda item: (
+            len(
+                assignment_students[item[0].assignment_id]
+                & assignment_students[item[1].assignment_id]
+            ),
+            item[0].assignment_id,
+            item[1].assignment_id,
+        )
+    )
+
+    capacity_candidates = []
+    for assignment in assignments:
+        needed = equipment_by_exam[assignment.exam_id]
+        accessible_students = {
+            student_id
+            for student_id in assignment_students[assignment.assignment_id]
+            if any(
+                accommodation.accommodation_type
+                == Accommodation.Type.ACCESSIBLE_ROOM
+                for accommodation in accommodations_for(
+                    student_id, assignment.start_at.date()
+                )
+            )
+        }
+        for room_id, room in rooms.items():
+            if room_id in {
+                row.room_id
+                for row in assignments_by_exam[assignment.exam_id]
+            }:
+                continue
+            capacity = _effective_capacity(
+                room_id, assignment.start_at.date(), capacities
+            )
+            if (
+                capacity <= 0
+                or capacity >= assignment.allocated_count
+                or not needed.issubset(room_equipment[room_id])
+                or (accessible_students and not room.is_accessible)
+                or not _covered(
+                    room_availability[room_id],
+                    assignment.start_at,
+                    assignment.end_at,
+                )
+                or any(
+                    _overlap(
+                        assignment.start_at,
+                        assignment.end_at,
+                        closure_start,
+                        closure_end,
+                    )
+                    for closure_start, closure_end in closures[room_id]
+                )
+            ):
+                continue
+            capacity_candidates.append((assignment, room))
+
+    extra_time_candidates = []
+    for assignment in assignments:
+        if assignment.exam.duration_minutes >= (
+            assignment.end_at - assignment.start_at
+        ).total_seconds() / 60:
+            continue
+        for student_id in assignment_students[assignment.assignment_id]:
+            if assignment_required[assignment.assignment_id].get(
+                student_id, 0
+            ) <= assignment.exam.duration_minutes:
+                continue
+            if any(
+                accommodation.accommodation_type
+                == Accommodation.Type.EXTRA_TIME
+                for accommodation in accommodations_for(
+                    student_id, assignment.start_at.date()
+                )
+            ):
+                extra_time_candidates.append((assignment, student_id))
+    if not overlap_candidates or not capacity_candidates or not extra_time_candidates:
+        raise ValueError(
+            "Baseline does not contain suitable student-overlap, capacity, "
+            "and extra-time candidates for the anomaly fixture."
+        )
+
+    invigilator_sets = {
+        assignment.assignment_id: set(
+            assignment_invigilators[assignment.assignment_id]
+        )
+        for assignment in assignments
+    }
+    chosen = None
+    for a, b, shared_student in overlap_candidates:
+        b_staff_needed = max(
+            staff_count(b), len(assignment_invigilators[b.assignment_id])
+        )
+        b_staff_pool = [
+            invigilator_id
+            for invigilator_id in active_invigilators
+            if invigilator_id not in invigilator_sets[a.assignment_id]
+            and _covered(
+                invigilator_availability[invigilator_id],
+                a.start_at,
+                a.end_at,
+            )
+        ]
+        b_staff_candidates = list(
+            islice(
+                itertools.combinations(b_staff_pool, b_staff_needed),
+                16,
+            )
+        )
+        if not b_staff_candidates:
+            continue
+        for c, c_room in capacity_candidates:
+            used = {a.exam_id, b.exam_id, c.exam_id}
+            if len(used) != 3:
+                continue
+            for d in assignments:
+                if d.exam_id in used:
+                    continue
+                d_invigilators = assignment_invigilators[d.assignment_id]
+                for e in assignments:
+                    if (
+                        e.exam_id in used
+                        or e.exam_id == d.exam_id
+                        or e.room_id == d.room_id
+                        or not d_invigilators
+                    ):
+                        continue
+                    if assignment_students[d.assignment_id] & assignment_students[
+                        e.assignment_id
+                    ]:
+                        continue
+                    if required_for(e.assignment_id) > (
+                        d.end_at - d.start_at
+                    ).total_seconds() / 60:
+                        continue
+                    if not _covered(
+                        room_availability[e.room_id], d.start_at, d.end_at
+                    ) or any(
+                        _overlap(
+                            d.start_at,
+                            d.end_at,
+                            closure_start,
+                            closure_end,
+                        )
+                        for closure_start, closure_end in closures[e.room_id]
+                    ):
+                        continue
+                    e_staff_needed = max(
+                        staff_count(e),
+                        len(assignment_invigilators[e.assignment_id]),
+                        1,
+                    )
+                    d_staff_set = set().union(
+                        *(
+                            invigilator_sets[row.assignment_id]
+                            for row in assignments_by_exam[d.exam_id]
+                        )
+                    )
+                    e_staff_pool = [
+                        invigilator_id
+                        for invigilator_id in active_invigilators
+                        if invigilator_id not in d_staff_set
+                        and invigilator_id not in {d_invigilators[0]}
+                        and _covered(
+                            invigilator_availability[invigilator_id],
+                            d.start_at,
+                            d.end_at,
+                        )
+                    ]
+                    e_staff_candidates = [
+                        (d_invigilators[0], *other_staff)
+                        for other_staff in islice(
+                            itertools.combinations(
+                                e_staff_pool, e_staff_needed - 1
+                            ),
+                            16,
+                        )
+                    ]
+                    if not e_staff_candidates:
+                        continue
+                    for f, f_student in extra_time_candidates:
+                        used_with_f = used | {d.exam_id, e.exam_id, f.exam_id}
+                        if len(used_with_f) != 6:
+                            continue
+                        for g in assignments:
+                            if g.exam_id in used_with_f:
+                                continue
+                            selection = {
+                                "A": a,
+                                "B": b,
+                                "C": c,
+                                "C_room": c_room,
+                                "D": d,
+                                "E": e,
+                                "F": f,
+                                "F_student": f_student,
+                                "G": g,
+                                "shared_student": shared_student,
+                                "D_invigilator": d_invigilators[0],
+                            }
+                            for b_staff in b_staff_candidates:
+                                for e_staff in e_staff_candidates:
+                                    selection["B_invigilators"] = b_staff
+                                    selection["E_invigilators"] = e_staff
+                                    if _fixture_is_valid(
+                                        selection,
+                                        assignments_by_exam,
+                                        assignment_students,
+                                        assignment_invigilators,
+                                        assignment_required,
+                                        invigilator_availability,
+                                        room_availability,
+                                        closures,
+                                        capacities,
+                                        rooms,
+                                        room_equipment,
+                                        equipment_by_exam,
+                                        accommodations_for,
+                                    ):
+                                        chosen = selection.copy()
+                                        break
+                                if chosen:
+                                    break
+                            if chosen:
+                                break
+                        if chosen:
+                            break
+                    if chosen:
+                        break
+                if chosen:
+                    break
+            if chosen:
+                break
+        if chosen:
+            break
+    if chosen is None:
+        raise ValueError(
+            "Could not select seven compatible exams for the anomaly fixture."
+        )
+    return chosen
+
+
+def _fixture_is_valid(
+    selection,
+    assignments_by_exam,
+    assignment_students,
+    assignment_invigilators,
+    assignment_required,
+    invigilator_availability,
+    room_availability,
+    closures,
+    capacities,
+    rooms,
+    room_equipment,
+    equipment_by_exam,
+    accommodations_for,
+):
+    selected_exam_ids = {
+        selection[key].exam_id for key in ("A", "B", "C", "D", "E", "F", "G")
+    }
+    records = []
+    for exam_id in selected_exam_ids:
+        for assignment in assignments_by_exam[exam_id]:
+            assignment_id = assignment.assignment_id
+            record = {
+                "source": assignment,
+                "key": assignment_id,
+                "exam_id": exam_id,
+                "room_id": assignment.room_id,
+                "start_at": assignment.start_at,
+                "end_at": assignment.end_at,
+                "students": assignment_students[assignment_id],
+                "invigilators": set(assignment_invigilators[assignment_id]),
+            }
+            if assignment_id == selection["B"].assignment_id:
+                record["start_at"] = selection["A"].start_at
+                record["end_at"] = selection["A"].end_at
+                record["invigilators"] = set(
+                    selection["B_invigilators"]
+                )
+            if assignment_id == selection["C"].assignment_id:
+                record["room_id"] = selection["C_room"].room_id
+            if assignment_id == selection["E"].assignment_id:
+                record["start_at"] = selection["D"].start_at
+                record["end_at"] = selection["D"].end_at
+                record["invigilators"] = set(
+                    selection["E_invigilators"]
+                )
+            if assignment_id == selection["F"].assignment_id:
+                record["end_at"] = record["start_at"] + dt.timedelta(
+                    minutes=assignment.exam.duration_minutes
+                )
+            records.append(record)
+
+    expected_student_pair = {
+        selection["A"].assignment_id,
+        selection["B"].assignment_id,
+    }
+    expected_invigilator_pair = {
+        selection["D"].assignment_id,
+        selection["E"].assignment_id,
+    }
+    for record in records:
+        assignment = record["source"]
+        interval_minutes = (
+            record["end_at"] - record["start_at"]
+        ).total_seconds() / 60
+        room = rooms.get(record["room_id"])
+        if room is None:
+            return False
+        if not _covered(
+            room_availability[record["room_id"]],
+            record["start_at"],
+            record["end_at"],
+        ):
+            return False
+        if any(
+            _overlap(
+                record["start_at"],
+                record["end_at"],
+                closure_start,
+                closure_end,
+            )
+            for closure_start, closure_end in closures[record["room_id"]]
+        ):
+            return False
+        capacity = _effective_capacity(
+            record["room_id"], record["start_at"].date(), capacities
+        )
+        if (
+            record["key"] != selection["C"].assignment_id
+            and assignment.allocated_count > capacity
+        ):
+            return False
+        if not equipment_by_exam[record["exam_id"]].issubset(
+            room_equipment[record["room_id"]]
+        ):
+            return False
+        accommodations = {
+            student_id: accommodations_for(
+                student_id, record["start_at"].date()
+            )
+            for student_id in record["students"]
+        }
+        separate_students = {
+            student_id
+            for student_id, student_accommodations in accommodations.items()
+            if any(
+                item.accommodation_type == Accommodation.Type.SEPARATE_ROOM
+                for item in student_accommodations
+            )
+        }
+        if separate_students and len(separate_students) != len(
+            record["students"]
+        ):
+            return False
+        if any(
+            item.accommodation_type == Accommodation.Type.ACCESSIBLE_ROOM
+            for student_accommodations in accommodations.values()
+            for item in student_accommodations
+        ) and not room.is_accessible:
+            return False
+        if (
+            record["key"] != selection["F"].assignment_id
+            and any(
+                assignment_required[record["key"]].get(student_id, 0)
+                > interval_minutes
+                for student_id in record["students"]
+            )
+        ):
+            return False
+        if interval_minutes < assignment.exam.duration_minutes:
+            return False
+        for invigilator_id in record["invigilators"]:
+            if not _covered(
+                invigilator_availability[invigilator_id],
+                record["start_at"],
+                record["end_at"],
+            ):
+                return False
+
+    for index, first in enumerate(records):
+        for second in records[index + 1:]:
+            if first["exam_id"] == second["exam_id"]:
+                continue
+            if not _overlap(
+                first["start_at"],
+                first["end_at"],
+                second["start_at"],
+                second["end_at"],
+            ):
+                continue
+            pair = {first["key"], second["key"]}
+            if first["room_id"] == second["room_id"]:
+                return False
+            if (
+                first["students"] & second["students"]
+                and pair != expected_student_pair
+            ):
+                return False
+            if (
+                first["invigilators"] & second["invigilators"]
+                and pair != expected_invigilator_pair
+            ):
+                return False
+    return True
 
 ======================================================================
 FILE: apps\validation\services\data_validator.py
@@ -5753,6 +8424,109 @@ def validate_master_data():
     }
 
 ======================================================================
+FILE: apps\validation\services\evaluator.py
+======================================================================
+"""Compare persisted violation detections with run-scoped ground truth."""
+
+import csv
+import json
+from pathlib import Path
+
+from django.conf import settings
+
+from apps.validation.models import DetectedViolation
+
+GROUND_TRUTH_FIELDS = {
+    "anomaly_id",
+    "issue_type",
+    "assignment_id",
+    "affected_entity_id",
+    "expected_violation_code",
+    "run_id",
+}
+
+
+def load_ground_truth(run_id=None):
+    path = Path(settings.BASE_DIR) / "data" / "ground_truth.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Ground-truth file does not exist: {path}")
+    with path.open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        if not reader.fieldnames or not GROUND_TRUTH_FIELDS.issubset(
+            reader.fieldnames
+        ):
+            raise ValueError("Ground-truth CSV is missing required columns.")
+        rows = list(reader)
+    if run_id is not None:
+        rows = [row for row in rows if row["run_id"] == run_id]
+        if not rows:
+            raise ValueError(
+                f"No ground-truth rows are recorded for run {run_id}."
+            )
+    return rows
+
+
+def evaluate(validation_run):
+    ground_truth = load_ground_truth(
+        validation_run.scheduler_run.run_id
+    )
+    detected = list(
+        DetectedViolation.objects.filter(validation_run=validation_run)
+        .exclude(assignment__isnull=True)
+        .values_list("assignment_id", "violation_code")
+    )
+    expected_set = {
+        (
+            row["assignment_id"],
+            row["expected_violation_code"],
+        )
+        for row in ground_truth
+    }
+    detected_set = set(detected)
+    true_positives = expected_set & detected_set
+    false_positives = detected_set - expected_set
+    false_negatives = expected_set - detected_set
+
+    precision = (
+        len(true_positives) / (len(true_positives) + len(false_positives))
+        if true_positives or false_positives
+        else 0.0
+    )
+    recall = (
+        len(true_positives) / (len(true_positives) + len(false_negatives))
+        if true_positives or false_negatives
+        else 0.0
+    )
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+
+    return {
+        "validation_id": validation_run.validation_id,
+        "scheduler_run": validation_run.scheduler_run_id,
+        "ground_truth_count": len(expected_set),
+        "detected_count": len(detected_set),
+        "tp": len(true_positives),
+        "fp": len(false_positives),
+        "fn": len(false_negatives),
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "true_positives": sorted(true_positives),
+        "false_positives": sorted(false_positives),
+        "false_negatives": sorted(false_negatives),
+    }
+
+
+def write_evaluation_report(result):
+    output = Path(settings.BASE_DIR) / "data" / "anomaly_evaluation.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return output
+
+======================================================================
 FILE: apps\validation\services\exporter.py
 ======================================================================
 """Canonical CSV, JSON, and SQLite-compatible SQL exports."""
@@ -5900,6 +8674,238 @@ def write_export_manifest(outdir, seed, scale):
     return manifest
 
 ======================================================================
+FILE: apps\validation\services\metrics.py
+======================================================================
+"""Scheduling coverage, utilization, and persisted-row reconciliation metrics."""
+
+from collections import defaultdict
+
+from django.conf import settings
+from django.db.models import Count
+
+from apps.core.models import Enrollment, Exam
+from apps.scheduling.models import (
+    Availability,
+    InvigilatorAssignment,
+    ScheduleAssignment,
+    ScheduleEvent,
+    StudentRoomAllocation,
+    UnassignedExam,
+)
+from apps.validation.services.schedule_validator import effective_capacity
+
+
+def _merge_intervals(intervals):
+    merged = []
+    for start_at, end_at in sorted(intervals):
+        if not merged or start_at > merged[-1][1]:
+            merged.append([start_at, end_at])
+        else:
+            merged[-1][1] = max(merged[-1][1], end_at)
+    return merged
+
+
+def _available_minutes(queryset, resource_field, resource_ids, start_at, end_at):
+    if not resource_ids or start_at is None or end_at is None:
+        return 0
+    by_resource = defaultdict(list)
+    for resource_id, window_start, window_end in queryset.filter(
+        **{f"{resource_field}__in": resource_ids}
+    ).values_list(resource_field, "start_at", "end_at"):
+        clipped_start = max(window_start, start_at)
+        clipped_end = min(window_end, end_at)
+        if clipped_start < clipped_end:
+            by_resource[resource_id].append((clipped_start, clipped_end))
+    return sum(
+        int((right - left).total_seconds() // 60)
+        for intervals in by_resource.values()
+        for left, right in _merge_intervals(intervals)
+    )
+
+
+def compute_business_metrics(run):
+    term = settings.SCHEDULER_POLICY["TERM"]
+    assignments = list(
+        ScheduleAssignment.objects.filter(
+            run=run,
+            status=ScheduleAssignment.Status.ASSIGNED,
+        ).select_related("exam", "room")
+    )
+    assignment_exam_ids = {assignment.exam_id for assignment in assignments}
+    unassigned_rows = list(
+        UnassignedExam.objects.filter(run=run).select_related("exam")
+    )
+    unassigned_exam_ids = {row.exam_id for row in unassigned_rows}
+    event_exam_ids = set(
+        ScheduleEvent.objects.filter(run=run, exam__isnull=False)
+        .exclude(event_type=ScheduleEvent.EventType.CANCELLED)
+        .values_list("exam_id", flat=True)
+    )
+    represented_exam_ids = (
+        assignment_exam_ids | unassigned_exam_ids | event_exam_ids
+    )
+    scheduled_exam_ids = represented_exam_ids - unassigned_exam_ids
+    total_exams = len(represented_exam_ids)
+
+    active_enrollments_by_exam = dict(
+        Enrollment.objects.filter(
+            term=term,
+            status=Enrollment.Status.ACTIVE,
+            course__exams__exam_id__in=scheduled_exam_ids,
+            course__exams__term=term,
+        )
+        .values("course__exams__exam_id")
+        .annotate(count=Count("enrollment_id"))
+        .values_list("course__exams__exam_id", "count")
+    )
+    allocation_counts = dict(
+        StudentRoomAllocation.objects.filter(run=run)
+        .values("exam_id")
+        .annotate(count=Count("allocation_id"))
+        .values_list("exam_id", "count")
+    )
+    active_enrollment_count = sum(active_enrollments_by_exam.values())
+    allocation_count = sum(allocation_counts.values())
+    student_allocation_rate = (
+        allocation_count / active_enrollment_count
+        if active_enrollment_count
+        else 0.0
+    )
+
+    allocated_seats = sum(assignment.allocated_count for assignment in assignments)
+    used_capacity = sum(
+        effective_capacity(assignment.room_id, assignment.start_at.date())
+        for assignment in assignments
+    )
+    seat_utilization = (
+        allocated_seats / used_capacity if used_capacity else 0.0
+    )
+
+    assignment_starts = [assignment.start_at for assignment in assignments]
+    assignment_ends = [assignment.end_at for assignment in assignments]
+    start_at = min(assignment_starts) if assignment_starts else None
+    end_at = max(assignment_ends) if assignment_ends else None
+    room_ids = {assignment.room_id for assignment in assignments}
+    room_booked_minutes = sum(
+        (assignment.end_at - assignment.start_at).total_seconds() / 60
+        for assignment in assignments
+    )
+    room_available_minutes = _available_minutes(
+        Availability.objects.filter(room__isnull=False),
+        "room_id",
+        room_ids,
+        start_at,
+        end_at,
+    )
+    room_time_utilization = (
+        room_booked_minutes / room_available_minutes
+        if room_available_minutes
+        else 0.0
+    )
+
+    invigilator_assignments = list(
+        InvigilatorAssignment.objects.filter(
+            assignment__run=run,
+            assignment__status=ScheduleAssignment.Status.ASSIGNED,
+        ).select_related("assignment")
+    )
+    invigilator_ids = {
+        row.invigilator_id for row in invigilator_assignments
+    }
+    invigilator_booked_minutes = sum(
+        (row.assignment.end_at - row.assignment.start_at).total_seconds()
+        / 60
+        for row in invigilator_assignments
+    )
+    invigilator_available_minutes = _available_minutes(
+        Availability.objects.filter(invigilator__isnull=False),
+        "invigilator_id",
+        invigilator_ids,
+        start_at,
+        end_at,
+    )
+    invigilator_utilization = (
+        invigilator_booked_minutes / invigilator_available_minutes
+        if invigilator_available_minutes
+        else 0.0
+    )
+
+    documented_exceptions = sum(
+        bool(row.primary_reason_code and row.evidence)
+        for row in unassigned_rows
+    )
+    exception_documentation_rate = (
+        documented_exceptions / len(unassigned_rows)
+        if unassigned_rows
+        else 1.0
+    )
+
+    reconciliation_errors = []
+    if len(represented_exam_ids) != (
+        len(scheduled_exam_ids) + len(unassigned_exam_ids)
+    ):
+        reconciliation_errors.append(
+            "Run exam count does not equal scheduled plus unassigned."
+        )
+    if scheduled_exam_ids & unassigned_exam_ids:
+        reconciliation_errors.append(
+            "An exam is both scheduled and marked unassigned."
+        )
+
+    assignment_counts = dict(
+        StudentRoomAllocation.objects.filter(run=run)
+        .values("assignment_id")
+        .annotate(count=Count("allocation_id"))
+        .values_list("assignment_id", "count")
+    )
+    for assignment in assignments:
+        actual = assignment_counts.get(assignment.assignment_id, 0)
+        if actual != assignment.allocated_count:
+            reconciliation_errors.append(
+                f"{assignment.assignment_id}: allocated_count="
+                f"{assignment.allocated_count}, student allocations={actual}."
+            )
+
+    for exam_id in sorted(scheduled_exam_ids):
+        expected = active_enrollments_by_exam.get(exam_id, 0)
+        actual = allocation_counts.get(exam_id, 0)
+        if actual != expected:
+            reconciliation_errors.append(
+                f"{exam_id}: allocated={actual}, active_enrollments={expected}."
+            )
+    if set(allocation_counts) - scheduled_exam_ids:
+        reconciliation_errors.append(
+            "Student allocations exist for exams not scheduled in this run."
+        )
+    if set(unassigned_exam_ids) & set(allocation_counts):
+        reconciliation_errors.append(
+            "Unassigned exams have persisted student allocations."
+        )
+
+    total_exam_count = Exam.objects.filter(term=term).count()
+    return {
+        "scheduler_run": run.run_id,
+        "term": term,
+        "total_exams": total_exams,
+        "term_exam_count": total_exam_count,
+        "scheduled_exams": len(scheduled_exam_ids),
+        "unassigned_exams": len(unassigned_exam_ids),
+        "scheduling_coverage": round(
+            len(scheduled_exam_ids) / total_exams if total_exams else 0.0,
+            4,
+        ),
+        "student_allocation_rate": round(student_allocation_rate, 4),
+        "room_seat_utilization": round(seat_utilization, 4),
+        "room_time_utilization": round(room_time_utilization, 4),
+        "invigilator_utilization": round(invigilator_utilization, 4),
+        "exception_documentation_rate": round(
+            exception_documentation_rate, 4
+        ),
+        "reconciliation_ok": not reconciliation_errors,
+        "reconciliation_errors": reconciliation_errors,
+    }
+
+======================================================================
 FILE: apps\validation\services\reproducibility.py
 ======================================================================
 """Compare canonical persisted data across isolated generator runs."""
@@ -5999,6 +9005,582 @@ def verify_reproducibility(seed, scale):
             and first["row_counts"] == second["row_counts"]
         ),
     }
+
+======================================================================
+FILE: apps\validation\services\schedule_validator.py
+======================================================================
+"""Independent validation of persisted schedule assignments."""
+
+from collections import defaultdict
+
+from django.db.models import Count, Q
+
+from apps.core.models import (
+    Accommodation,
+    Enrollment,
+    ExamRequirement,
+    ExamRequirementEquipment,
+    RoomCapacity,
+)
+from apps.scheduling.models import (
+    Availability,
+    InvigilatorAssignment,
+    RoomClosure,
+    ScheduleAssignment,
+    StudentRoomAllocation,
+)
+from apps.validation.models import DetectedViolation
+
+CODE = DetectedViolation.Code
+
+
+def _overlap(first_start, first_end, second_start, second_end):
+    return first_start < second_end and second_start < first_end
+
+
+def effective_capacity(room_id, on_date):
+    capacity = (
+        RoomCapacity.objects.filter(
+            room_id=room_id,
+            effective_from__lte=on_date,
+        )
+        .filter(Q(effective_to__isnull=True) | Q(effective_to__gte=on_date))
+        .order_by("-effective_from")
+        .first()
+    )
+    return capacity.exam_capacity if capacity else 0
+
+
+def _assignments(run):
+    return ScheduleAssignment.objects.filter(
+        run=run,
+        status=ScheduleAssignment.Status.ASSIGNED,
+    )
+
+
+def check_student_overlap(run):
+    allocations = list(
+        StudentRoomAllocation.objects.filter(run=run)
+        .select_related("assignment", "exam")
+        .order_by("student_id", "assignment_id")
+    )
+    by_student = defaultdict(list)
+    for allocation in allocations:
+        by_student[allocation.student_id].append(allocation)
+
+    violations = []
+    for student_id, items in by_student.items():
+        for index, first in enumerate(items):
+            for second in items[index + 1:]:
+                if first.exam_id == second.exam_id:
+                    continue
+                if not _overlap(
+                    first.assignment.start_at,
+                    first.assignment.end_at,
+                    second.assignment.start_at,
+                    second.assignment.end_at,
+                ):
+                    continue
+                for assignment, other in (
+                    (first.assignment, second.assignment),
+                    (second.assignment, first.assignment),
+                ):
+                    violations.append(
+                        {
+                            "code": CODE.STUDENT_DOUBLE_BOOKING,
+                            "assignment": assignment,
+                            "entity_id": student_id,
+                            "detail": f"Student overlaps {other.assignment_id}.",
+                        }
+                    )
+    return violations, len(allocations)
+
+
+def check_room_capacity(run):
+    assignments = list(_assignments(run).select_related("room"))
+    violations = []
+    for assignment in assignments:
+        capacity = effective_capacity(
+            assignment.room_id, assignment.start_at.date()
+        )
+        if assignment.allocated_count > capacity:
+            violations.append(
+                {
+                    "code": CODE.ROOM_CAPACITY_EXCEEDED,
+                    "assignment": assignment,
+                    "entity_id": assignment.room_id,
+                    "detail": (
+                        f"Allocated {assignment.allocated_count}; "
+                        f"effective capacity {capacity}."
+                    ),
+                }
+            )
+    return violations, len(assignments)
+
+
+def check_missing_equipment(run):
+    assignments = list(
+        _assignments(run).select_related("room", "exam")
+    )
+    requirements = defaultdict(set)
+    requirement_by_exam = dict(
+        ExamRequirement.objects.filter(
+            exam_id__in={assignment.exam_id for assignment in assignments}
+        ).values_list("exam_id", "requirement_id")
+    )
+    for requirement_id, equipment_id in (
+        ExamRequirementEquipment.objects.filter(
+            requirement__exam_id__in={a.exam_id for a in assignments}
+        ).values_list("requirement_id", "equipment_id")
+    ):
+        requirements[requirement_id].add(equipment_id)
+    violations = []
+    for assignment in assignments:
+        requirement_id = requirement_by_exam.get(assignment.exam_id)
+        needed = requirements.get(requirement_id, set())
+        if not needed:
+            continue
+        available = set(
+            assignment.room.equipment.values_list("code", flat=True)
+        )
+        missing = needed - available
+        if missing:
+            violations.append(
+                {
+                    "code": CODE.MISSING_EQUIPMENT,
+                    "assignment": assignment,
+                    "entity_id": assignment.room_id,
+                    "detail": f"Missing equipment: {sorted(missing)}.",
+                }
+            )
+    return violations, len(assignments)
+
+
+def check_room_double_booking(run):
+    assignments = list(_assignments(run).order_by("room_id", "start_at"))
+    by_room = defaultdict(list)
+    for assignment in assignments:
+        by_room[assignment.room_id].append(assignment)
+
+    violations = []
+    for room_id, items in by_room.items():
+        for index, first in enumerate(items):
+            for second in items[index + 1:]:
+                if second.start_at >= first.end_at:
+                    break
+                if not _overlap(
+                    first.start_at,
+                    first.end_at,
+                    second.start_at,
+                    second.end_at,
+                ):
+                    continue
+                for assignment, other in (
+                    (first, second),
+                    (second, first),
+                ):
+                    violations.append(
+                        {
+                            "code": CODE.ROOM_DOUBLE_BOOKED,
+                            "assignment": assignment,
+                            "entity_id": room_id,
+                            "detail": f"Overlaps {other.assignment_id}.",
+                        }
+                    )
+    return violations, len(assignments)
+
+
+def check_invigilator_double_booking(run):
+    assignments = list(
+        InvigilatorAssignment.objects.filter(
+            assignment__run=run,
+            assignment__status=ScheduleAssignment.Status.ASSIGNED,
+        )
+        .select_related("assignment")
+        .order_by("invigilator_id", "assignment__start_at")
+    )
+    by_invigilator = defaultdict(list)
+    for assignment in assignments:
+        by_invigilator[assignment.invigilator_id].append(
+            assignment.assignment
+        )
+
+    violations = []
+    for invigilator_id, items in by_invigilator.items():
+        for index, first in enumerate(items):
+            for second in items[index + 1:]:
+                if second.start_at >= first.end_at:
+                    break
+                if first.exam_id == second.exam_id:
+                    continue
+                if not _overlap(
+                    first.start_at,
+                    first.end_at,
+                    second.start_at,
+                    second.end_at,
+                ):
+                    continue
+                for assignment in (first, second):
+                    violations.append(
+                        {
+                            "code": CODE.INVIGILATOR_DOUBLE_BOOKED,
+                            "assignment": assignment,
+                            "entity_id": invigilator_id,
+                            "detail": "Invigilator is assigned to overlapping exams.",
+                        }
+                    )
+    return violations, len(assignments)
+
+
+def check_invigilator_availability(run):
+    assignments = list(
+        InvigilatorAssignment.objects.filter(
+            assignment__run=run,
+            assignment__status=ScheduleAssignment.Status.ASSIGNED,
+        ).select_related("assignment")
+    )
+    violations = []
+    for inv_assignment in assignments:
+        assignment = inv_assignment.assignment
+        available = Availability.objects.filter(
+            invigilator_id=inv_assignment.invigilator_id,
+            start_at__lte=assignment.start_at,
+            end_at__gte=assignment.end_at,
+        ).exists()
+        if not available:
+            violations.append(
+                {
+                    "code": CODE.INVIGILATOR_UNAVAILABLE,
+                    "assignment": assignment,
+                    "entity_id": inv_assignment.invigilator_id,
+                    "detail": "Invigilator is unavailable for the full interval.",
+                }
+            )
+    return violations, len(assignments)
+
+
+def check_accommodation(run):
+    allocations = list(
+        StudentRoomAllocation.objects.filter(run=run)
+        .select_related("assignment__room", "exam")
+        .order_by("assignment_id", "student_id")
+    )
+    by_assignment = defaultdict(list)
+    for allocation in allocations:
+        by_assignment[allocation.assignment_id].append(allocation)
+    student_ids = {allocation.student_id for allocation in allocations}
+    accommodation_by_student = defaultdict(list)
+    for accommodation in Accommodation.objects.filter(
+        student_id__in=student_ids,
+        status=Accommodation.Status.ACTIVE,
+    ).order_by("accommodation_id"):
+        accommodation_by_student[accommodation.student_id].append(
+            accommodation
+        )
+
+    violations = []
+    for items in by_assignment.values():
+        assignment = items[0].assignment
+        on_date = assignment.start_at.date()
+        minutes = (assignment.end_at - assignment.start_at).total_seconds() / 60
+        accommodations = {
+            item.student_id: [
+                accommodation
+                for accommodation in accommodation_by_student[item.student_id]
+                if accommodation.effective_from <= on_date
+                and (
+                    accommodation.effective_to is None
+                    or accommodation.effective_to >= on_date
+                )
+            ]
+            for item in items
+        }
+        separate_students = {
+            student_id
+            for student_id, student_accommodations in accommodations.items()
+            if any(
+                item.accommodation_type == Accommodation.Type.SEPARATE_ROOM
+                for item in student_accommodations
+            )
+        }
+        reported = False
+        for item in items:
+            student_accommodations = accommodations[item.student_id]
+            extra_percent = max(
+                (
+                    acc.extra_time_percent
+                    for acc in student_accommodations
+                    if acc.accommodation_type == Accommodation.Type.EXTRA_TIME
+                ),
+                default=0,
+            )
+            required_minutes = (
+                item.exam.duration_minutes * (100 + extra_percent) + 99
+            ) // 100
+            separate_required = item.student_id in separate_students
+            accessible_required = any(
+                acc.accommodation_type == Accommodation.Type.ACCESSIBLE_ROOM
+                for acc in student_accommodations
+            )
+            reasons = []
+            if minutes < required_minutes:
+                reasons.append(
+                    f"requires {required_minutes} minutes, got {int(minutes)}"
+                )
+            if accessible_required and not assignment.room.is_accessible:
+                reasons.append("requires an accessible room")
+            if separate_required and len(separate_students) != len(items):
+                reasons.append("separate-room student shares with other students")
+            if (
+                not separate_required
+                and separate_students
+            ):
+                reasons.append("non-separate student shares a separate room")
+            if reasons and not reported:
+                violations.append(
+                    {
+                        "code": CODE.ACCOMMODATION_VIOLATION,
+                        "assignment": assignment,
+                        "entity_id": item.student_id,
+                        "detail": "; ".join(reasons) + ".",
+                    }
+                )
+                reported = True
+    return violations, len(allocations)
+
+
+def check_room_unavailable(run):
+    assignments = list(_assignments(run))
+    violations = []
+    for assignment in assignments:
+        covered = Availability.objects.filter(
+            room_id=assignment.room_id,
+            start_at__lte=assignment.start_at,
+            end_at__gte=assignment.end_at,
+        ).exists()
+        closed = RoomClosure.objects.filter(
+            room_id=assignment.room_id,
+        ).filter(
+            Q(run__isnull=True) | Q(run=run)
+        ).filter(
+            start_at__lt=assignment.end_at,
+            end_at__gt=assignment.start_at,
+        ).exists()
+        if not covered or closed:
+            detail = (
+                "Room availability does not cover the full interval."
+                if not covered
+                else "Room closure overlaps the assignment."
+            )
+            violations.append(
+                {
+                    "code": CODE.ROOM_UNAVAILABLE_VIOLATION,
+                    "assignment": assignment,
+                    "entity_id": assignment.room_id,
+                    "detail": detail,
+                }
+            )
+    return violations, len(assignments)
+
+
+def check_student_allocation_mismatch(run):
+    assignments = list(
+        _assignments(run).select_related("exam").order_by("exam_id")
+    )
+    if not assignments:
+        return [], 0
+    counts = dict(
+        StudentRoomAllocation.objects.filter(run=run)
+        .values("assignment_id")
+        .annotate(count=Count("allocation_id"))
+        .values_list("assignment_id", "count")
+    )
+    violations = []
+    for assignment in assignments:
+        actual = counts.get(assignment.assignment_id, 0)
+        if actual != assignment.allocated_count:
+            violations.append(
+                {
+                    "code": CODE.STUDENT_ALLOCATION_MISMATCH,
+                    "assignment": assignment,
+                    "entity_id": assignment.assignment_id,
+                    "detail": (
+                        f"Allocated count is {assignment.allocated_count}; "
+                        f"found {actual} student allocations."
+                    ),
+                }
+            )
+
+    by_exam = defaultdict(list)
+    for assignment in assignments:
+        by_exam[assignment.exam_id].append(assignment)
+    for exam_id, exam_assignments in by_exam.items():
+        expected = set(
+            Enrollment.objects.filter(
+                course_id=exam_assignments[0].exam.course_id,
+                term=exam_assignments[0].exam.term,
+                status=Enrollment.Status.ACTIVE,
+            ).values_list("student_id", flat=True)
+        )
+        actual = set(
+            StudentRoomAllocation.objects.filter(
+                run=run, exam_id=exam_id
+            ).values_list("student_id", flat=True)
+        )
+        if actual != expected:
+            violations.append(
+                {
+                    "code": CODE.STUDENT_ALLOCATION_MISMATCH,
+                    "assignment": exam_assignments[0],
+                    "entity_id": exam_id,
+                    "detail": (
+                        f"Student roster differs: missing={len(expected - actual)}, "
+                        f"unexpected={len(actual - expected)}."
+                    ),
+                }
+            )
+    return violations, len(assignments)
+
+
+def check_invalid_duration(run):
+    assignments = list(
+        _assignments(run).select_related("exam")
+    )
+    violations = []
+    for assignment in assignments:
+        duration = (
+            assignment.end_at - assignment.start_at
+        ).total_seconds() / 60
+        if duration < assignment.exam.duration_minutes:
+            violations.append(
+                {
+                    "code": CODE.INVALID_DURATION,
+                    "assignment": assignment,
+                    "entity_id": assignment.assignment_id,
+                    "detail": (
+                        f"Duration {int(duration)} is shorter than the "
+                        f"{assignment.exam.duration_minutes}-minute exam."
+                    ),
+                }
+            )
+    return violations, len(assignments)
+
+
+CHECKS = [
+    ("student_double_booking", check_student_overlap),
+    ("room_capacity", check_room_capacity),
+    ("missing_equipment", check_missing_equipment),
+    ("room_double_booked", check_room_double_booking),
+    ("invigilator_double_booked", check_invigilator_double_booking),
+    ("invigilator_unavailable", check_invigilator_availability),
+    ("accommodation_violation", check_accommodation),
+    ("room_unavailable", check_room_unavailable),
+    ("student_allocation_mismatch", check_student_allocation_mismatch),
+    ("invalid_duration", check_invalid_duration),
+]
+
+======================================================================
+FILE: apps\validation\services\validation_runner.py
+======================================================================
+"""Persist schedule validation runs and scorecards."""
+
+import json
+from pathlib import Path
+
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+
+from apps.core.services.id_generator import make_id
+from apps.core.services.lifecycle import transition
+from apps.scheduling.models import SchedulerRun
+from apps.validation.models import DetectedViolation, ValidationRun
+from apps.validation.services.metrics import compute_business_metrics
+from apps.validation.services.schedule_validator import CHECKS
+
+
+def _next_id(model, field_name, kind):
+    last_id = model.objects.order_by(f"-{field_name}").values_list(
+        field_name, flat=True
+    ).first()
+    number = int(last_id.split("-")[-1]) + 1 if last_id else 1
+    return make_id(kind, number)
+
+
+def run_all_checks(run):
+    """Run all independent checks and persist their violations and scorecard."""
+    if run.status != SchedulerRun.Status.COMPLETED:
+        raise ValueError(
+            f"Scheduler run {run.run_id} must be COMPLETED before validation."
+        )
+
+    with transaction.atomic():
+        validation_run = ValidationRun.objects.create(
+            validation_id=_next_id(
+                ValidationRun, "validation_id", "validation_run"
+            ),
+            scheduler_run=run,
+            status=ValidationRun.Status.RUNNING,
+        )
+        violation_number = int(
+            DetectedViolation.objects.order_by("-violation_id")
+            .values_list("violation_id", flat=True)
+            .first()
+            .split("-")[-1]
+        ) if DetectedViolation.objects.exists() else 0
+
+        scorecard = []
+        total_checks = 0
+        total_failures = 0
+        for check_name, check in CHECKS:
+            violations, inspected = check(run)
+            total_checks += inspected
+            total_failures += len(violations)
+            scorecard.append(
+                {
+                    "check": check_name,
+                    "checks_performed": inspected,
+                    "failures": len(violations),
+                    "status": "PASS" if not violations else "FAIL",
+                }
+            )
+            for violation in violations:
+                violation_number += 1
+                DetectedViolation.objects.create(
+                    violation_id=make_id("violation", violation_number),
+                    validation_run=validation_run,
+                    violation_code=violation["code"],
+                    assignment=violation.get("assignment"),
+                    entity_id=violation.get("entity_id", ""),
+                    detail=violation.get("detail", ""),
+                )
+
+        validation_run.checks_performed = total_checks
+        validation_run.failures = total_failures
+        validation_run.save(update_fields=["checks_performed", "failures"])
+        transition(
+            validation_run,
+            ValidationRun.Status.PASSED
+            if total_failures == 0
+            else ValidationRun.Status.FAILED_CHECKS,
+        )
+        validation_run.finished_at = timezone.now()
+        validation_run.save(update_fields=["finished_at"])
+
+        result = {
+            "validation_id": validation_run.validation_id,
+            "scheduler_run": run.run_id,
+            "status": validation_run.status,
+            "checks_performed": total_checks,
+            "failures": total_failures,
+            "checks": scorecard,
+            "business_metrics": compute_business_metrics(run),
+        }
+
+    output = Path(settings.BASE_DIR) / "data" / "validation_scorecard.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return validation_run, result
 
 ======================================================================
 FILE: apps\validation\services\__init__.py
@@ -6110,6 +9692,7 @@ SCHEDULER_POLICY = {
     "OPERATING_END": "20:00",
     "SLOT_STARTS": ["08:00", "10:30", "13:00", "15:30"],
     "INVIGILATOR_RATIO": 50,
+    "MAX_CONSECUTIVE_INVIGILATOR_HOURS": 4,
     "HARD_BUFFER_MINUTES": 0,
     "SOFT_STUDENT_BUFFER_MINUTES": 30,
 }
@@ -6136,6 +9719,68 @@ application = get_wsgi_application()
 ======================================================================
 FILE: config\__init__.py
 ======================================================================
+
+======================================================================
+FILE: data\ground_truth.json
+======================================================================
+[
+  {
+    "anomaly_id": "EDGE-001",
+    "issue_type": "STUDENT_OVERLAP",
+    "assignment_id": "ASN-EXAM-2026-000001-ROOM-000011-RUN-000002",
+    "affected_entity_id": "STU-000001",
+    "expected_violation_code": "STUDENT_DOUBLE_BOOKING",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-001",
+    "issue_type": "STUDENT_OVERLAP",
+    "assignment_id": "ASN-EXAM-2026-000020-ROOM-000001-RUN-000002",
+    "affected_entity_id": "STU-000001",
+    "expected_violation_code": "STUDENT_DOUBLE_BOOKING",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-002",
+    "issue_type": "CAPACITY_EXCEEDED",
+    "assignment_id": "ASN-EXAM-2026-000004-ROOM-000003-RUN-000002",
+    "affected_entity_id": "ROOM-000003",
+    "expected_violation_code": "ROOM_CAPACITY_EXCEEDED",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-003",
+    "issue_type": "INVIGILATOR_CLASH",
+    "assignment_id": "ASN-EXAM-2026-000006-ROOM-000011-RUN-000002",
+    "affected_entity_id": "INV-000023",
+    "expected_violation_code": "INVIGILATOR_DOUBLE_BOOKED",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-003",
+    "issue_type": "INVIGILATOR_CLASH",
+    "assignment_id": "ASN-EXAM-2026-000010-ROOM-000001-RUN-000002",
+    "affected_entity_id": "INV-000023",
+    "expected_violation_code": "INVIGILATOR_DOUBLE_BOOKED",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-004",
+    "issue_type": "ACCOMMODATION_BREACH",
+    "assignment_id": "ASN-EXAM-2026-000003-ROOM-000001-RUN-000002",
+    "affected_entity_id": "STU-000017",
+    "expected_violation_code": "ACCOMMODATION_VIOLATION",
+    "run_id": "RUN-000002"
+  },
+  {
+    "anomaly_id": "EDGE-005",
+    "issue_type": "ROOM_CLOSED",
+    "assignment_id": "ASN-EXAM-2026-000007-ROOM-000011-RUN-000002",
+    "affected_entity_id": "ROOM-000011",
+    "expected_violation_code": "ROOM_UNAVAILABLE_VIOLATION",
+    "run_id": "RUN-000002"
+  }
+]
 
 ======================================================================
 FILE: data\reproducibility_report.json
@@ -6180,6 +9825,95 @@ FILE: data\reproducibility_report.json
     "core_examrequirementequipment": 297
   },
   "match": true
+}
+
+======================================================================
+FILE: data\validation_scorecard.json
+======================================================================
+{
+  "validation_id": "VAL-000001",
+  "scheduler_run": "RUN-000001",
+  "status": "PASSED",
+  "checks_performed": 1502,
+  "failures": 0,
+  "checks": [
+    {
+      "check": "student_double_booking",
+      "checks_performed": 632,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "room_capacity",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "missing_equipment",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "room_double_booked",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "invigilator_double_booked",
+      "checks_performed": 32,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "invigilator_unavailable",
+      "checks_performed": 32,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "accommodation_violation",
+      "checks_performed": 632,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "room_unavailable",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "student_allocation_mismatch",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    },
+    {
+      "check": "invalid_duration",
+      "checks_performed": 29,
+      "failures": 0,
+      "status": "PASS"
+    }
+  ],
+  "business_metrics": {
+    "scheduler_run": "RUN-000001",
+    "term": "2026-FALL",
+    "total_exams": 20,
+    "term_exam_count": 20,
+    "scheduled_exams": 15,
+    "unassigned_exams": 5,
+    "scheduling_coverage": 0.75,
+    "student_allocation_rate": 1.0,
+    "room_seat_utilization": 0.1132,
+    "room_time_utilization": 0.0829,
+    "invigilator_utilization": 0.0944,
+    "exception_documentation_rate": 1.0,
+    "reconciliation_ok": true,
+    "reconciliation_errors": []
+  }
 }
 
 ======================================================================
@@ -14282,7 +18016,7 @@ FILE: docs\architecture.md
 |---|---|
 | `apps/core` | Master data models, ID generator, data generator service, export command |
 | `apps/scheduling` | Scheduling models, conflict graph, slot/room/invigilator allocators, accommodation logic, explanations, `run_scheduler` |
-| `apps/validation` | `ValidationRun`, `DetectedViolation`, data validator, schedule validator, anomaly detector, evaluator, metrics |
+| `apps/validation` | `ValidationRun`, `DetectedViolation`, independent schedule checks, anomaly fixtures, evaluator, and business metrics |
 | `apps/dashboard` | Views, forms, templates, static files |
 | `apps/accounts` | Groups and permissions for the five actors |
 | `generator/` | Pure-Python seeded generation logic (config, master data, enrollments, anomalies) |
@@ -14411,7 +18145,9 @@ These are university policies chosen by us, not given by the problem statement.
 | Exams per course | 1 per term |
 | Invigilator ratio | 1 per 50 students, minimum 1 per room |
 | Invigilator daily limit | 8 hours (`max_daily_hours`) |
+| Invigilator consecutive limit | 4 continuous hours; any positive gap resets the consecutive-work period |
 | Room turnover buffer | 0 minutes |
+| Anomaly-fixture room closures | Scoped to their `SchedulerRun`; null run means a global closure |
 | Accommodated student rule | Allocated to rooms whose interval covers their extended time. First implementation reserves the maximum required duration for everyone sharing that room. |
 | Separate-room accommodation | Student is placed in a room with only accommodated students |
 | Accommodation share | About 8-10 percent of students |
@@ -14609,7 +18345,7 @@ Unique together: (run, exam, room). All rooms of one exam in a run share the sam
 | Equipment | code | name | e.g. `PROJECTOR, COMPUTER, LAB_BENCH, ACCESSIBLE_DESK` |
 | RoomEquipment | auto | room FK, equipment FK | unique (room, equipment) |
 | ExamRequirementEquipment | auto | requirement FK, equipment FK | unique pair |
-| RoomClosure | `CLS-` | room FK, start_at, end_at, reason (`MAINTENANCE, EVENT, REPAIR`) | end_at > start_at |
+| RoomClosure | `CLS-` | room FK, optional scheduler-run FK, start_at, end_at, reason (`MAINTENANCE, EVENT, REPAIR`) | end_at > start_at; null run means a global closure |
 | TimeSlot | `SLOT-` | slot_date, start_time, label | unique (slot_date, start_time) |
 | SchedulerRun | `RUN-` | run_type (`BASELINE, ANOMALY_FIXTURE`), status, algorithm_version, seed, started_at, finished_at, notes | never deleted |
 | ScheduleEvent | `EVT-` | run FK, assignment FK (null), exam FK, event_type (`ASSIGNED, MOVED, CANCELLED, UNASSIGNED, SUPERSEDED`), detail JSON, event_at | append-only; no update/delete |
@@ -14621,7 +18357,7 @@ Unique together: (run, exam, room). All rooms of one exam in a run share the sam
 
 ## Ground-truth file (NOT a database input)
 
-`data/ground_truth.csv` columns: `anomaly_id, issue_type, assignment_id, affected_entity_id, expected_violation_code`.
+`data/ground_truth.csv` columns: `anomaly_id, issue_type, assignment_id, affected_entity_id, expected_violation_code, run_id`.
 It is read only by the evaluator after detection finishes.
 
 ## Phase 3 generation assumptions
@@ -14633,6 +18369,10 @@ It is read only by the evaluator after detection finishes.
   ten courses without an exam; only courses with an exam receive enrollments.
 - Each student is enrolled in 4-6 exam courses. Enrollment counts are derived
   from the bridge rows rather than stored separately.
+- Lecture halls are accessible and provisioned for computer/projector/practical
+  examinations so both starter and full scales can schedule specialist exams
+  without relying on unusually rare room-type draws. Invigilators have broad
+  operating-day windows on a deterministic subset of exam days.
 - Generated identities are deterministic counters. Timestamps use the fixed
   UTC exam calendar; no external or personal data is used.
 - Assignment-linked anomaly labels are produced with the isolated anomaly
@@ -15042,6 +18782,9 @@ def generate_rooms_and_capacities(rng, count):
                 effective_to=None,
             )
         )
+    for room in rooms:
+        if room["room_type"] == "LECTURE_HALL":
+            room["is_accessible"] = True
     return rooms, capacities
 
 
@@ -15050,7 +18793,7 @@ def generate_room_equipment_pairs(rooms):
     for room in rooms:
         equipment = {"WHITEBOARD"}
         if room["room_type"] == "LECTURE_HALL":
-            equipment.add("PROJECTOR")
+            equipment.update({"COMPUTER", "LAB_BENCH", "PROJECTOR"})
         elif room["room_type"] == "COMPUTER_LAB":
             equipment.update({"COMPUTER", "PROJECTOR"})
         elif room["room_type"] == "SCIENCE_LAB":
@@ -15121,18 +18864,16 @@ def generate_invigilator_availability(rng, invigilators, start_index=1):
     for invigilator in invigilators:
         window_count = rng.randint(4, 7)
         for day in rng.sample(EXAM_DATES, min(window_count, len(EXAM_DATES))):
-            start_hour = rng.choice([8, 10, 13, 15])
-            end_hour = start_hour + rng.choice([3, 4, 5])
             availability.append(
                 dict(
                     availability_id=make_id("availability", index),
                     room_id=None,
                     invigilator_id=invigilator["invigilator_id"],
                     start_at=dt.datetime.fromisoformat(day).replace(
-                        hour=start_hour, tzinfo=dt.timezone.utc
+                        hour=8, tzinfo=dt.timezone.utc
                     ),
                     end_at=dt.datetime.fromisoformat(day).replace(
-                        hour=end_hour, tzinfo=dt.timezone.utc
+                        hour=20, tzinfo=dt.timezone.utc
                     ),
                 )
             )
@@ -15278,6 +19019,349 @@ def make_accommodation(n, student, **kw):
              accommodation_type="EXTRA_TIME", extra_time_percent=50, effective_from=D)
     d.update(kw)
     return Accommodation.objects.create(**d)
+
+======================================================================
+FILE: tests\test_accommodations.py
+======================================================================
+import datetime as dt
+
+from django.test import TestCase
+
+from apps.core.models import Accommodation, Student
+from apps.core.services.id_generator import make_id
+from apps.scheduling.services.accommodation import (
+    accommodations_active_on,
+    needs_accessible_room,
+    needs_separate_room,
+    required_minutes,
+)
+
+
+class AccommodationTests(TestCase):
+    def setUp(self):
+        self.student = Student.objects.create(
+            student_id=make_id("student", 1),
+            full_name="Test student",
+            email="student@example.test",
+            department="CS",
+            year_level=1,
+        )
+
+    def create_accommodation(self, number, **overrides):
+        values = {
+            "accommodation_id": make_id("accommodation", number),
+            "student": self.student,
+            "accommodation_type": Accommodation.Type.EXTRA_TIME,
+            "extra_time_percent": 25,
+            "effective_from": dt.date(2026, 9, 1),
+            "effective_to": dt.date(2026, 12, 31),
+        }
+        values.update(overrides)
+        return Accommodation.objects.create(**values)
+
+    def test_required_time_uses_strictest_active_extension(self):
+        twenty_five = self.create_accommodation(1)
+        fifty = self.create_accommodation(
+            2, extra_time_percent=50
+        )
+        self.assertEqual(required_minutes(120, [twenty_five, fifty]), 180)
+        self.assertEqual(required_minutes(120, []), 120)
+        self.assertEqual(required_minutes(180, [fifty]), 270)
+
+    def test_effective_dates_and_status_are_honored(self):
+        expired = self.create_accommodation(
+            1, effective_to=dt.date(2026, 10, 1)
+        )
+        future = self.create_accommodation(
+            2, effective_from=dt.date(2026, 12, 11)
+        )
+        revoked = self.create_accommodation(
+            3, status=Accommodation.Status.REVOKED
+        )
+        self.assertEqual(
+            accommodations_active_on(
+                self.student.student_id, dt.date(2026, 12, 10)
+            ),
+            [],
+        )
+        self.assertEqual(
+            accommodations_active_on(
+                self.student.student_id, dt.date(2026, 12, 11)
+            ),
+            [future],
+        )
+        self.assertNotIn(expired, [future, revoked])
+
+    def test_room_accommodation_flags(self):
+        separate = self.create_accommodation(
+            1,
+            accommodation_type=Accommodation.Type.SEPARATE_ROOM,
+            extra_time_percent=0,
+        )
+        accessible = self.create_accommodation(
+            2,
+            accommodation_type=Accommodation.Type.ACCESSIBLE_ROOM,
+            extra_time_percent=0,
+        )
+        self.assertTrue(needs_separate_room([separate]))
+        self.assertFalse(needs_accessible_room([separate]))
+        self.assertTrue(needs_accessible_room([accessible]))
+
+======================================================================
+FILE: tests\test_anomalies.py
+======================================================================
+import json
+import tempfile
+from io import StringIO
+from pathlib import Path
+
+from django.core.management import call_command
+from django.test import TestCase, override_settings
+
+from apps.core.services.data_generator import generate_and_persist
+from apps.scheduling.models import ScheduleAssignment, SchedulerRun
+from apps.scheduling.services.scheduler import run_scheduler
+from apps.validation.models import DetectedViolation, ValidationRun
+from apps.validation.services.anomaly_injector import inject
+from apps.validation.services.evaluator import evaluate
+from apps.validation.services.validation_runner import run_all_checks
+from generator.config import SEED_DEFAULT
+
+
+class AnomalyPipelineTests(TestCase):
+    def test_phase_five_management_commands(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        baseline = run_scheduler(seed=SEED_DEFAULT)
+        with tempfile.TemporaryDirectory(prefix="phase5_commands_") as folder:
+            with override_settings(BASE_DIR=Path(folder)):
+                baseline_output = StringIO()
+                call_command(
+                    "validate_schedule",
+                    run=baseline.run_id,
+                    stdout=baseline_output,
+                )
+                self.assertIn("PASS", baseline_output.getvalue())
+
+                injection_output = StringIO()
+                call_command(
+                    "inject_anomalies",
+                    baseline=baseline.run_id,
+                    stdout=injection_output,
+                )
+                self.assertIn("ground-truth rows: 7", injection_output.getvalue())
+
+                detection_output = StringIO()
+                call_command("detect_violations", stdout=detection_output)
+                self.assertIn("total: 7 violations", detection_output.getvalue())
+
+                evaluation_output = StringIO()
+                call_command("evaluate_anomalies", stdout=evaluation_output)
+                self.assertIn("TP=7 FP=0 FN=0", evaluation_output.getvalue())
+                self.assertTrue(
+                    (Path(folder) / "data" / "anomaly_evaluation.json").exists()
+                )
+
+    def test_inject_detect_evaluate_and_revalidate_baseline(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        baseline = run_scheduler(seed=SEED_DEFAULT)
+        baseline_assignments = list(
+            ScheduleAssignment.objects.filter(run=baseline)
+            .order_by("assignment_id")
+            .values_list("assignment_id", "start_at", "end_at", "room_id")
+        )
+
+        with tempfile.TemporaryDirectory(prefix="phase5_outputs_") as folder:
+            with override_settings(BASE_DIR=Path(folder)):
+                anomaly_run, labels, selected = inject(baseline.run_id)
+                self.assertEqual(
+                    anomaly_run.run_type,
+                    SchedulerRun.RunType.ANOMALY_FIXTURE,
+                )
+                self.assertEqual(len(selected), 7)
+                self.assertEqual(len(labels), 7)
+                self.assertEqual(
+                    {row["issue_type"] for row in labels},
+                    {
+                        "STUDENT_OVERLAP",
+                        "CAPACITY_EXCEEDED",
+                        "INVIGILATOR_CLASH",
+                        "ACCOMMODATION_BREACH",
+                        "ROOM_CLOSED",
+                    },
+                )
+                self.assertEqual(
+                    {row["expected_violation_code"] for row in labels},
+                    {
+                        DetectedViolation.Code.STUDENT_DOUBLE_BOOKING,
+                        DetectedViolation.Code.ROOM_CAPACITY_EXCEEDED,
+                        DetectedViolation.Code.INVIGILATOR_DOUBLE_BOOKED,
+                        DetectedViolation.Code.ACCOMMODATION_VIOLATION,
+                        DetectedViolation.Code.ROOM_UNAVAILABLE_VIOLATION,
+                    },
+                )
+                with (Path(folder) / "data" / "ground_truth.json").open(
+                    encoding="utf-8"
+                ) as file:
+                    saved_labels = json.load(file)
+                self.assertEqual(len(saved_labels), 7)
+                self.assertEqual(
+                    {row["run_id"] for row in saved_labels},
+                    {anomaly_run.run_id},
+                )
+
+                validation_run, scorecard = run_all_checks(anomaly_run)
+                self.assertEqual(
+                    validation_run.status,
+                    ValidationRun.Status.FAILED_CHECKS,
+                )
+                self.assertEqual(scorecard["failures"], 7)
+                result = evaluate(validation_run)
+
+                self.assertEqual(result["tp"], 7, msg=result)
+                self.assertEqual(result["fp"], 0, msg=result)
+                self.assertEqual(result["fn"], 0, msg=result)
+                self.assertEqual(result["precision"], 1.0)
+                self.assertEqual(result["recall"], 1.0)
+                self.assertEqual(result["f1"], 1.0)
+                self.assertTrue(
+                    scorecard["business_metrics"]["reconciliation_ok"],
+                    msg=scorecard["business_metrics"]["reconciliation_errors"],
+                )
+
+                baseline_validation, baseline_scorecard = run_all_checks(
+                    baseline
+                )
+
+        self.assertEqual(baseline_scorecard["failures"], 0)
+        self.assertEqual(
+            baseline_validation.status, ValidationRun.Status.PASSED
+        )
+        self.assertEqual(
+            list(
+                ScheduleAssignment.objects.filter(run=baseline)
+                .order_by("assignment_id")
+                .values_list(
+                    "assignment_id", "start_at", "end_at", "room_id"
+                )
+            ),
+            baseline_assignments,
+        )
+
+    def test_inject_rejects_non_baseline_run(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        baseline = run_scheduler(seed=SEED_DEFAULT)
+        anomaly, _labels, _selected = inject(baseline.run_id)
+
+        with self.assertRaisesRegex(ValueError, "not a BASELINE"):
+            inject(anomaly.run_id)
+
+    def test_evaluator_requires_run_scoped_ground_truth(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        baseline = run_scheduler(seed=SEED_DEFAULT)
+        with tempfile.TemporaryDirectory(prefix="phase5_outputs_") as folder:
+            with override_settings(BASE_DIR=Path(folder)):
+                validation_run, _scorecard = run_all_checks(baseline)
+                with self.assertRaises(FileNotFoundError):
+                    evaluate(validation_run)
+
+======================================================================
+FILE: tests\test_conflict_graph.py
+======================================================================
+import datetime as dt
+
+from django.test import TestCase
+
+from apps.core.models import Course, Enrollment, Exam, Student
+from apps.core.services.id_generator import make_exam_id, make_id
+from apps.scheduling.services.conflict_graph import build_conflict_graph
+from apps.scheduling.services.slot_allocator import color_exams
+from generator.config import TERM
+
+
+class ConflictGraphTests(TestCase):
+    def setUp(self):
+        self.students = [
+            Student.objects.create(
+                student_id=make_id("student", index),
+                full_name=f"Student {index}",
+                email=f"student{index}@example.test",
+                department="CS",
+                year_level=1,
+            )
+            for index in range(1, 4)
+        ]
+        self.exams = []
+        self.courses = []
+        for index in range(1, 4):
+            course = Course.objects.create(
+                course_id=make_id("course", index),
+                course_code=f"CS{100 + index}",
+                title=f"Course {index}",
+                department="CS",
+                credits=3,
+            )
+            self.courses.append(course)
+            self.exams.append(
+                Exam.objects.create(
+                    exam_id=make_exam_id(index),
+                    course=course,
+                    title=f"Exam {index}",
+                    term=TERM,
+                    duration_minutes=120,
+                    status=Exam.Status.PLANNED,
+                )
+            )
+
+    def _enroll(self, index, student, course, *, status="ACTIVE", term=TERM):
+        return Enrollment.objects.create(
+            enrollment_id=make_id("enrollment", index),
+            student=student,
+            course=course,
+            term=term,
+            status=status,
+            effective_from=dt.date(2026, 9, 1),
+        )
+
+    def test_edge_weights_count_shared_active_students(self):
+        self._enroll(1, self.students[0], self.courses[0])
+        self._enroll(2, self.students[0], self.courses[1])
+        self._enroll(3, self.students[1], self.courses[0])
+        self._enroll(4, self.students[1], self.courses[1])
+        self._enroll(5, self.students[2], self.courses[0])
+        self._enroll(6, self.students[2], self.courses[2])
+        graph, students_by_exam = build_conflict_graph(self.exams, TERM)
+
+        self.assertEqual(graph.edge_weight(self.exams[0].exam_id, self.exams[1].exam_id), 2)
+        self.assertEqual(graph.edge_weight(self.exams[0].exam_id, self.exams[2].exam_id), 1)
+        self.assertEqual(graph.degree[self.exams[0].exam_id], 2)
+        self.assertEqual(len(students_by_exam[self.exams[0].exam_id]), 3)
+
+    def test_dropped_and_other_term_enrollments_do_not_create_edges(self):
+        self._enroll(
+            1, self.students[0], self.courses[0], status=Enrollment.Status.DROPPED
+        )
+        self._enroll(
+            2, self.students[0], self.courses[1], term="2025-FALL"
+        )
+        graph, students_by_exam = build_conflict_graph(self.exams, TERM)
+        self.assertEqual(graph.edge_weight(self.exams[0].exam_id, self.exams[1].exam_id), 0)
+        self.assertEqual(students_by_exam[self.exams[0].exam_id], set())
+
+    def test_dsatur_colors_conflicting_exams_into_different_time_groups(self):
+        self._enroll(1, self.students[0], self.courses[0])
+        self._enroll(2, self.students[0], self.courses[1])
+        self._enroll(3, self.students[1], self.courses[0])
+        self._enroll(4, self.students[1], self.courses[1])
+        self._enroll(5, self.students[2], self.courses[0])
+        self._enroll(6, self.students[2], self.courses[2])
+        graph, students_by_exam = build_conflict_graph(self.exams, TERM)
+
+        ordered, colors = color_exams(graph, students_by_exam)
+
+        self.assertEqual(len(ordered), len(self.exams))
+        for exam_id, neighbors in graph.adj.items():
+            for neighbor_id in neighbors:
+                self.assertNotEqual(colors[exam_id], colors[neighbor_id])
 
 ======================================================================
 FILE: tests\test_data_validator.py
@@ -15548,6 +19632,223 @@ class IdGeneratorTests(SimpleTestCase):
 
     def test_ids_are_deterministic(self):
         self.assertEqual([make_id("course", i) for i in range(1, 4)], [make_id("course", i) for i in range(1, 4)])
+
+======================================================================
+FILE: tests\test_invigilator_allocator.py
+======================================================================
+import datetime as dt
+
+from django.test import TestCase
+
+from apps.core.models import Course, Exam, Invigilator, Room, Student
+from apps.core.services.id_generator import make_exam_id, make_id
+from apps.scheduling.models import UnassignedExam
+from apps.scheduling.services.context import SchedulingContext
+from apps.scheduling.services.invigilator_allocator import allocate_invigilators
+from apps.scheduling.services.slot_allocator import buffered_overlap
+
+
+UTC = dt.timezone.utc
+
+
+class InvigilatorAllocatorTests(TestCase):
+    def setUp(self):
+        course = Course.objects.create(
+            course_id=make_id("course", 1),
+            course_code="CS101",
+            title="Course",
+            department="CS",
+            credits=3,
+        )
+        self.exam = Exam.objects.create(
+            exam_id=make_exam_id(1),
+            course=course,
+            title="Exam",
+            term="2026-FALL",
+            duration_minutes=120,
+            status=Exam.Status.PLANNED,
+        )
+        self.room = Room.objects.create(
+            room_id=make_id("room", 1),
+            building="Block A",
+            room_number="A-001",
+            room_type=Room.RoomType.CLASSROOM,
+        )
+        self.student = Student.objects.create(
+            student_id=make_id("student", 1),
+            full_name="Student",
+            email="student@example.test",
+            department="CS",
+            year_level=1,
+        )
+        self.invigilator = Invigilator.objects.create(
+            invigilator_id=make_id("invigilator", 1),
+            full_name="Invigilator",
+            email="invigilator@example.test",
+            max_daily_hours=2,
+        )
+        self.start = dt.datetime(2026, 12, 7, 8, tzinfo=UTC)
+        self.end = dt.datetime(2026, 12, 7, 10, tzinfo=UTC)
+
+    def context(self, availability, policy=None):
+        return SchedulingContext(
+            run=type("Run", (), {"run_id": "RUN-000001"})(),
+            term="2026-FALL",
+            exams=[],
+            graph=None,
+            students_by_exam={},
+            invigilators=[self.invigilator],
+            invigilator_avails={
+                self.invigilator.invigilator_id: availability
+            },
+            exam_requirements={},
+            policy=policy,
+        )
+
+    def test_exact_availability_window_is_sufficient(self):
+        context = self.context([(self.start, self.end)])
+        assignments, reason = allocate_invigilators(
+            context,
+            self.exam,
+            [(self.room, [self.student])],
+            self.start,
+            self.end,
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(assignments[0][1], [self.invigilator])
+
+    def test_unavailable_invigilator_has_reason_code(self):
+        context = self.context([])
+        assignments, reason = allocate_invigilators(
+            context,
+            self.exam,
+            [(self.room, [self.student])],
+            self.start,
+            self.end,
+        )
+        self.assertIsNone(assignments)
+        self.assertEqual(reason, UnassignedExam.Reason.NO_INVIGILATOR)
+
+    def test_daily_hours_limit_is_respected(self):
+        context = self.context([(self.start, self.end)])
+        context.invigilator_bookings[self.invigilator.invigilator_id].append(
+            (
+                dt.datetime(2026, 12, 7, 10, tzinfo=UTC),
+                dt.datetime(2026, 12, 7, 11, tzinfo=UTC),
+            )
+        )
+        assignments, reason = allocate_invigilators(
+            context,
+            self.exam,
+            [(self.room, [self.student])],
+            self.start,
+            self.end,
+        )
+        self.assertIsNone(assignments)
+        self.assertEqual(reason, UnassignedExam.Reason.NO_INVIGILATOR)
+
+    def test_hard_buffer_is_required_between_invigilator_assignments(self):
+        candidate_start = dt.datetime(2026, 12, 7, 10, 15, tzinfo=UTC)
+        self.assertTrue(
+            buffered_overlap(
+                self.start,
+                self.end,
+                candidate_start,
+                dt.datetime(2026, 12, 7, 11, tzinfo=UTC),
+                30,
+            )
+        )
+        self.assertFalse(
+            buffered_overlap(
+                self.start,
+                self.end,
+                candidate_start,
+                dt.datetime(2026, 12, 7, 11, tzinfo=UTC),
+                15,
+            )
+        )
+
+    def test_consecutive_hours_limit_is_respected(self):
+        candidate_start = self.end
+        exact_limit_end = dt.datetime(2026, 12, 7, 12, tzinfo=UTC)
+        candidate_end = dt.datetime(2026, 12, 7, 12, 30, tzinfo=UTC)
+        self.invigilator.max_daily_hours = 8
+        self.invigilator.save(update_fields=["max_daily_hours"])
+        exact_limit_context = self.context(
+            [(self.start, exact_limit_end)],
+            policy={"MAX_CONSECUTIVE_INVIGILATOR_HOURS": 4},
+        )
+        exact_limit_context.invigilator_bookings[
+            self.invigilator.invigilator_id
+        ].append((self.start, self.end))
+        assignments, reason = allocate_invigilators(
+            exact_limit_context,
+            self.exam,
+            [(self.room, [self.student])],
+            candidate_start,
+            exact_limit_end,
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(assignments[0][1], [self.invigilator])
+
+        context = self.context(
+            [(self.start, candidate_end)],
+            policy={"MAX_CONSECUTIVE_INVIGILATOR_HOURS": 4},
+        )
+        context.invigilator_bookings[self.invigilator.invigilator_id].append(
+            (self.start, self.end)
+        )
+
+        assignments, reason = allocate_invigilators(
+            context,
+            self.exam,
+            [(self.room, [self.student])],
+            candidate_start,
+            candidate_end,
+        )
+
+        self.assertIsNone(assignments)
+        self.assertEqual(reason, UnassignedExam.Reason.NO_INVIGILATOR)
+
+======================================================================
+FILE: tests\test_metrics.py
+======================================================================
+import tempfile
+from pathlib import Path
+
+from django.test import TestCase, override_settings
+
+from apps.core.services.data_generator import generate_and_persist
+from apps.scheduling.services.scheduler import run_scheduler
+from apps.validation.services.metrics import compute_business_metrics
+from generator.config import SEED_DEFAULT
+
+
+class BusinessMetricsTests(TestCase):
+    def test_metrics_reconcile_baseline_assignments_and_unassigned_exams(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        run = run_scheduler(seed=SEED_DEFAULT)
+        with tempfile.TemporaryDirectory(prefix="phase5_metrics_") as folder:
+            with override_settings(BASE_DIR=Path(folder)):
+                metrics = compute_business_metrics(run)
+
+        self.assertEqual(
+            metrics["total_exams"],
+            metrics["scheduled_exams"] + metrics["unassigned_exams"],
+        )
+        self.assertEqual(metrics["term_exam_count"], 20)
+        self.assertEqual(metrics["scheduling_coverage"], 0.75)
+        self.assertAlmostEqual(metrics["student_allocation_rate"], 1.0)
+        self.assertTrue(
+            metrics["reconciliation_ok"],
+            msg=metrics["reconciliation_errors"],
+        )
+        for metric in (
+            "room_seat_utilization",
+            "room_time_utilization",
+            "invigilator_utilization",
+        ):
+            self.assertGreaterEqual(metrics[metric], 0.0)
 
 ======================================================================
 FILE: tests\test_models.py
@@ -15966,6 +20267,480 @@ class ReproducibilityTests(TestCase):
         verify_reproducibility(seed=SEED_DEFAULT, scale="starter")
         self.assertEqual(Student.objects.count(), initial_count)
         self.assertEqual(canonical_checksum(), initial_checksum)
+
+======================================================================
+FILE: tests\test_scheduler.py
+======================================================================
+from collections import defaultdict
+
+from django.db.models import Count, Q
+from django.test import TestCase
+
+from apps.core.models import (
+    Accommodation,
+    Enrollment,
+    Exam,
+    ExamRequirementEquipment,
+    RoomCapacity,
+    RoomEquipment,
+)
+from apps.core.services.data_generator import generate_and_persist
+from apps.scheduling.models import (
+    Availability,
+    InvigilatorAssignment,
+    RoomClosure,
+    ScheduleAssignment,
+    ScheduleEvent,
+    SchedulerRun,
+    StudentRoomAllocation,
+    UnassignedExam,
+)
+from apps.scheduling.services.scheduler import run_scheduler
+from generator.config import SEED_DEFAULT, TERM
+
+
+class SchedulerTests(TestCase):
+    def setUp(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+
+    def test_run_schedules_exams_and_persists_allocation_rows(self):
+        run = run_scheduler(seed=SEED_DEFAULT)
+        self.assertEqual(run.status, SchedulerRun.Status.COMPLETED)
+        statuses = set(
+            Exam.objects.filter(term=TERM).values_list("status", flat=True)
+        )
+        self.assertLessEqual(
+            statuses, {Exam.Status.SCHEDULED, Exam.Status.UNASSIGNED}
+        )
+        self.assertEqual(
+            Exam.objects.filter(
+                term=TERM,
+                status__in=[Exam.Status.SCHEDULED, Exam.Status.UNASSIGNED],
+            ).count(),
+            Exam.objects.filter(term=TERM).count(),
+        )
+        self.assertGreater(ScheduleAssignment.objects.filter(run=run).count(), 0)
+        self.assertGreater(
+            StudentRoomAllocation.objects.filter(run=run).count(), 0
+        )
+        self.assertGreater(
+            InvigilatorAssignment.objects.filter(
+                assignment__run=run
+            ).count(),
+            0,
+        )
+        self.assertEqual(
+            ScheduleEvent.objects.filter(run=run).count(),
+            Exam.objects.filter(term=TERM).count(),
+        )
+
+    def test_allocations_reconcile_with_active_enrollments(self):
+        run = run_scheduler(seed=SEED_DEFAULT)
+        allocated = dict(
+            StudentRoomAllocation.objects.filter(run=run)
+            .values("exam_id")
+            .annotate(count=Count("allocation_id"))
+            .values_list("exam_id", "count")
+        )
+        enrolled = dict(
+            Enrollment.objects.filter(
+                term=TERM, status=Enrollment.Status.ACTIVE
+            )
+            .values("course__exams__exam_id")
+            .annotate(count=Count("enrollment_id"))
+            .values_list("course__exams__exam_id", "count")
+        )
+        scheduled_exam_ids = set(
+            Exam.objects.filter(
+                term=TERM, status=Exam.Status.SCHEDULED
+            ).values_list("exam_id", flat=True)
+        )
+        unassigned_exam_ids = set(
+            UnassignedExam.objects.filter(run=run).values_list(
+                "exam_id", flat=True
+            )
+        )
+        self.assertEqual(
+            len(scheduled_exam_ids) + len(unassigned_exam_ids),
+            Exam.objects.filter(term=TERM).count(),
+        )
+        self.assertFalse(scheduled_exam_ids & unassigned_exam_ids)
+        for exam_id in scheduled_exam_ids:
+            self.assertEqual(
+                allocated.get(exam_id, 0), enrolled.get(exam_id, 0), msg=exam_id
+            )
+        self.assertTrue(
+            set(allocated).issubset(scheduled_exam_ids),
+            "Unassigned exams must not retain partial student allocations.",
+        )
+
+    def test_unassigned_rows_always_include_reason_and_evidence(self):
+        run = run_scheduler(seed=SEED_DEFAULT)
+        for row in UnassignedExam.objects.filter(run=run):
+            self.assertIn(
+                row.primary_reason_code,
+                {choice.value for choice in UnassignedExam.Reason},
+            )
+            self.assertTrue(row.evidence)
+
+    def test_rerun_preserves_previous_history_and_is_deterministic(self):
+        first_run = run_scheduler(seed=SEED_DEFAULT)
+        first_assignments = list(
+            ScheduleAssignment.objects.filter(run=first_run)
+            .order_by("exam_id", "room_id")
+            .values_list("exam_id", "room_id", "start_at", "end_at")
+        )
+        first_events = ScheduleEvent.objects.filter(run=first_run).count()
+
+        second_run = run_scheduler(seed=SEED_DEFAULT)
+        second_assignments = list(
+            ScheduleAssignment.objects.filter(run=second_run)
+            .order_by("exam_id", "room_id")
+            .values_list("exam_id", "room_id", "start_at", "end_at")
+        )
+        self.assertEqual(first_assignments, second_assignments)
+        self.assertEqual(
+            ScheduleAssignment.objects.filter(run=first_run).count(),
+            len(first_assignments),
+        )
+        self.assertEqual(
+            ScheduleEvent.objects.filter(run=first_run).count(), first_events
+        )
+        self.assertNotEqual(first_run.run_id, second_run.run_id)
+
+    def test_schedule_obeys_room_staff_student_and_accommodation_constraints(self):
+        run = run_scheduler(seed=SEED_DEFAULT)
+        room_intervals = defaultdict(list)
+        staff_intervals = defaultdict(list)
+        student_intervals = defaultdict(list)
+
+        for assignment in ScheduleAssignment.objects.filter(run=run):
+            room = assignment.room
+            start_at, end_at = assignment.start_at, assignment.end_at
+            room_intervals[room.room_id].append((start_at, end_at))
+
+            capacity = RoomCapacity.objects.filter(
+                room=room,
+                effective_from__lte=start_at.date(),
+            ).filter(
+                Q(effective_to__isnull=True)
+                | Q(effective_to__gte=start_at.date())
+            ).first()
+            self.assertIsNotNone(capacity)
+            self.assertLessEqual(
+                assignment.allocated_count, capacity.exam_capacity
+            )
+            self.assertTrue(
+                set(
+                    ExamRequirementEquipment.objects.filter(
+                        requirement__exam=assignment.exam
+                    ).values_list("equipment_id", flat=True)
+                ).issubset(
+                    set(
+                        RoomEquipment.objects.filter(room=room).values_list(
+                            "equipment_id", flat=True
+                        )
+                    )
+                )
+            )
+            self.assertTrue(
+                Availability.objects.filter(
+                    room=room,
+                    start_at__lte=start_at,
+                    end_at__gte=end_at,
+                ).exists()
+            )
+            self.assertFalse(
+                RoomClosure.objects.filter(
+                    room=room,
+                    start_at__lt=end_at,
+                    end_at__gt=start_at,
+                ).exists()
+            )
+
+            allocations = list(
+                StudentRoomAllocation.objects.filter(
+                    assignment=assignment
+                ).select_related("student")
+            )
+            self.assertEqual(len(allocations), assignment.allocated_count)
+            for allocation in allocations:
+                self.assertGreaterEqual(
+                    (end_at - start_at).total_seconds() / 60,
+                    allocation.required_minutes,
+                )
+                student_intervals[allocation.student_id].append(
+                    (start_at, end_at)
+                )
+
+            exam_date = start_at.date()
+            accommodations_by_student = {
+                allocation.student_id: list(
+                    Accommodation.objects.filter(
+                        student_id=allocation.student_id,
+                        status=Accommodation.Status.ACTIVE,
+                        effective_from__lte=exam_date,
+                    ).filter(
+                        Q(effective_to__isnull=True)
+                        | Q(effective_to__gte=exam_date)
+                    )
+                )
+                for allocation in allocations
+            }
+            if any(
+                any(
+                    accommodation.accommodation_type
+                    == Accommodation.Type.SEPARATE_ROOM
+                    for accommodation in student_accommodations
+                )
+                for student_accommodations in accommodations_by_student.values()
+            ):
+                self.assertTrue(
+                    all(
+                        any(
+                            accommodation.accommodation_type
+                            == Accommodation.Type.SEPARATE_ROOM
+                            for accommodation in student_accommodations
+                        )
+                        for student_accommodations
+                        in accommodations_by_student.values()
+                    )
+                )
+            if any(
+                any(
+                    accommodation.accommodation_type
+                    == Accommodation.Type.ACCESSIBLE_ROOM
+                    for accommodation in student_accommodations
+                )
+                for student_accommodations in accommodations_by_student.values()
+            ):
+                self.assertTrue(room.is_accessible)
+
+            for inv_assignment in InvigilatorAssignment.objects.filter(
+                assignment=assignment
+            ).select_related("invigilator"):
+                self.assertTrue(
+                    Availability.objects.filter(
+                        invigilator=inv_assignment.invigilator,
+                        start_at__lte=start_at,
+                        end_at__gte=end_at,
+                    ).exists()
+                )
+                staff_intervals[
+                    inv_assignment.invigilator_id
+                ].append((start_at, end_at))
+
+        for intervals_by_resource in (
+            room_intervals,
+            staff_intervals,
+            student_intervals,
+        ):
+            for intervals in intervals_by_resource.values():
+                intervals.sort()
+                for first, second in zip(intervals, intervals[1:]):
+                    self.assertLessEqual(first[1], second[0])
+
+    def test_failed_run_type_is_rejected(self):
+        with self.assertRaises(ValueError):
+            run_scheduler(run_type="INVALID")
+
+======================================================================
+FILE: tests\test_schedule_validator.py
+======================================================================
+import datetime as dt
+import tempfile
+from pathlib import Path
+
+from django.test import TestCase, override_settings
+
+from apps.core.models import (
+    ExamRequirementEquipment,
+    Invigilator,
+    RoomEquipment,
+)
+from apps.core.services.data_generator import generate_and_persist
+from apps.scheduling.models import (
+    Availability,
+    InvigilatorAssignment,
+    ScheduleAssignment,
+)
+from apps.scheduling.services.scheduler import run_scheduler
+from apps.validation.models import DetectedViolation, ValidationRun
+from apps.validation.services import schedule_validator
+from apps.validation.services.validation_runner import run_all_checks
+from generator.config import SEED_DEFAULT
+
+
+class ScheduleValidatorTests(TestCase):
+    def test_baseline_schedule_passes_all_independent_checks(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        scheduler_run = run_scheduler(seed=SEED_DEFAULT)
+        with tempfile.TemporaryDirectory(prefix="schedule_scorecard_") as folder:
+            with override_settings(BASE_DIR=Path(folder)):
+                validation_run, scorecard = run_all_checks(scheduler_run)
+
+        self.assertEqual(validation_run.status, ValidationRun.Status.PASSED)
+        self.assertEqual(scorecard["failures"], 0)
+        self.assertEqual(len(scorecard["checks"]), 10)
+        self.assertTrue(
+            all(check["status"] == "PASS" for check in scorecard["checks"])
+        )
+        self.assertEqual(
+            DetectedViolation.objects.filter(
+                validation_run=validation_run
+            ).count(),
+            0,
+        )
+
+    def test_validation_run_is_persisted_with_finish_time(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        scheduler_run = run_scheduler(seed=SEED_DEFAULT)
+        before = ValidationRun.objects.count()
+
+        with tempfile.TemporaryDirectory(prefix="schedule_scorecard_") as folder:
+            with override_settings(BASE_DIR=Path(folder)):
+                validation_run, _scorecard = run_all_checks(scheduler_run)
+
+        self.assertEqual(ValidationRun.objects.count(), before + 1)
+        self.assertIsNotNone(validation_run.finished_at)
+
+    def test_independent_checks_detect_persisted_row_corruption(self):
+        generate_and_persist(seed=SEED_DEFAULT, scale="starter")
+        scheduler_run = run_scheduler(seed=SEED_DEFAULT)
+        assignments = list(
+            ScheduleAssignment.objects.filter(run=scheduler_run)
+            .select_related("exam", "room")
+            .order_by("assignment_id")
+        )
+
+        equipment_assignment = next(
+            assignment
+            for assignment in assignments
+            if ExamRequirementEquipment.objects.filter(
+                requirement__exam_id=assignment.exam_id
+            ).exists()
+        )
+        equipment_id = ExamRequirementEquipment.objects.filter(
+            requirement__exam_id=equipment_assignment.exam_id
+        ).values_list("equipment_id", flat=True).first()
+        RoomEquipment.objects.filter(
+            room_id=equipment_assignment.room_id,
+            equipment_id=equipment_id,
+        ).delete()
+        violations, _count = schedule_validator.check_missing_equipment(
+            scheduler_run
+        )
+        self.assertIn(
+            equipment_assignment.assignment_id,
+            {item["assignment"].assignment_id for item in violations},
+        )
+
+        room_assignment = assignments[0]
+        Availability.objects.filter(room_id=room_assignment.room_id).delete()
+        violations, _count = schedule_validator.check_room_unavailable(
+            scheduler_run
+        )
+        self.assertIn(
+            room_assignment.assignment_id,
+            {item["assignment"].assignment_id for item in violations},
+        )
+
+        allocation_assignment = ScheduleAssignment.objects.get(
+            pk=room_assignment.assignment_id
+        )
+        ScheduleAssignment.objects.filter(
+            pk=allocation_assignment.pk
+        ).update(allocated_count=allocation_assignment.allocated_count + 1)
+        violations, _count = (
+            schedule_validator.check_student_allocation_mismatch(
+                scheduler_run
+            )
+        )
+        self.assertIn(
+            allocation_assignment.assignment_id,
+            {item["assignment"].assignment_id for item in violations},
+        )
+
+        invalid_end = allocation_assignment.start_at + dt.timedelta(
+            minutes=allocation_assignment.exam.duration_minutes - 15
+        )
+        ScheduleAssignment.objects.filter(
+            pk=allocation_assignment.pk
+        ).update(end_at=invalid_end)
+        violations, _count = schedule_validator.check_invalid_duration(
+            scheduler_run
+        )
+        self.assertIn(
+            allocation_assignment.assignment_id,
+            {item["assignment"].assignment_id for item in violations},
+        )
+
+        room_pair = next(
+            (
+                (first, second)
+                for index, first in enumerate(assignments)
+                for second in assignments[index + 1:]
+                if first.exam_id != second.exam_id
+                and first.room_id != second.room_id
+                and not ScheduleAssignment.objects.filter(
+                    run=scheduler_run,
+                    exam_id=second.exam_id,
+                    room_id=first.room_id,
+                ).exists()
+            ),
+            None,
+        )
+        self.assertIsNotNone(room_pair)
+        first, second = room_pair
+        ScheduleAssignment.objects.filter(
+            pk=second.assignment_id
+        ).update(
+            room_id=first.room_id,
+            start_at=first.start_at,
+            end_at=first.end_at,
+        )
+        violations, _count = schedule_validator.check_room_double_booking(
+            scheduler_run
+        )
+        self.assertIn(
+            second.assignment_id,
+            {item["assignment"].assignment_id for item in violations},
+        )
+
+        inv_assignment = InvigilatorAssignment.objects.filter(
+            assignment__run=scheduler_run
+        ).select_related("assignment").first()
+        unavailable_invigilator = next(
+            (
+                invigilator
+                for invigilator in Invigilator.objects.filter(
+                    status=Invigilator.Status.ACTIVE
+                )
+                if not InvigilatorAssignment.objects.filter(
+                    assignment=inv_assignment.assignment,
+                    invigilator=invigilator,
+                ).exists()
+                and not Availability.objects.filter(
+                    invigilator=invigilator,
+                    start_at__lte=inv_assignment.assignment.start_at,
+                    end_at__gte=inv_assignment.assignment.end_at,
+                ).exists()
+            ),
+            None,
+        )
+        self.assertIsNotNone(unavailable_invigilator)
+        InvigilatorAssignment.objects.filter(
+            pk=inv_assignment.pk
+        ).update(invigilator=unavailable_invigilator)
+        violations, _count = (
+            schedule_validator.check_invigilator_availability(
+                scheduler_run
+            )
+        )
+        self.assertIn(
+            inv_assignment.assignment_id,
+            {item["assignment"].assignment_id for item in violations},
+        )
 
 ======================================================================
 FILE: tests\test_views.py

@@ -51,8 +51,8 @@
 | `apps/core` | Master data models, ID generator, data generator service, export command |
 | `apps/scheduling` | Scheduling models, conflict graph, slot/room/invigilator allocators, accommodation logic, explanations, `run_scheduler` |
 | `apps/validation` | `ValidationRun`, `DetectedViolation`, independent schedule checks, anomaly fixtures, evaluator, and business metrics |
-| `apps/dashboard` | Views, forms, templates, static files |
-| `apps/accounts` | Groups and permissions for the five actors |
+| `apps/dashboard` | Read-only dashboard views, filters, workflow actions, role helpers, templates, and static files |
+| Django auth groups | Learner, Instructor, Academic Administrator, Support Staff, and Platform Administrator role labels |
 | `generator/` | Pure-Python seeded generation logic (config, master data, enrollments, anomalies) |
 
 ## 4. Why the validator is independent
@@ -72,11 +72,16 @@ The baseline is never modified by the anomaly commands.
 
 | Actor | Responsibility | Access |
 |---|---|---|
-| Learner | View personal exam timetable | Own timetable only |
-| Instructor | View own courses and exams | Read-only, own courses |
-| Academic Administrator | Generate data, schedule, resolve exceptions | Run actions, exceptions |
-| Support Staff | Manage accommodation and accessibility info | Accommodation records |
-| Platform Administrator | Users, permissions, settings | Full |
+| Learner | View exam information | Read-only dashboard pages |
+| Instructor | View course and exam information | Read-only dashboard pages |
+| Academic Administrator | Run scheduling and validation workflows | Staff actions and exceptions |
+| Support Staff | Review accommodation and accessibility information | Read-only dashboard pages |
+| Platform Administrator | Users, permissions, settings | Django admin and staff actions |
+
+Dashboard pages are intentionally readable without login for demonstrations.
+Mutating workflow actions require a POST request and either Django staff status
+or membership in the Academic Administrator group. Internal record management
+remains in Django admin.
 
 ## 7. Technology notes
 
